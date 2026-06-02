@@ -1,0 +1,90 @@
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ============ PyInstaller ============
+build/
+dist/
+*.spec.bak
+*.pyz
+*.pkg
+
+# ============ IDE / Editor ============
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ============ Claude Code 本地配置 ============
+.claude/
+
+# ============ 项目运行时数据（不要提交真实账号/Cookie） ============
+# 真实的 ini 配置（含账号、Cookie、wx_link）
+config.ini
+duifenyi.ini
+*.ini.bak
+duifenyi.bak_*
+
+# 运行时日志与历史
+data/app.log
+data/sign_history.json
+data/usage_stats.json
+*.log
+
+# 加密密钥
+secret.key
+
+# 崩溃日志
+crash_log.txt
+
+# PyInstaller 压缩工具（按需下载，体积大）
+upx.exe
+upx
+
+# 旧的中间版本 / 备份 / 测试文件
+*.bak
+*.py.bak
+main.py.bak
+backup_*/
+修改/
+
+# 测试 / 计划 / 调试
+tests/
+test_*
+*_test.py
+plans/
+todo*.md
+*.tmp
+*.pyc
+__pycache__/
+qr_test.png
+新对话.png
+新对话*.png
+
+# 本地归档（保留本地，但不入库）
+_archive/

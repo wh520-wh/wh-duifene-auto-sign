@@ -1,0 +1,23 @@
+[INFO]
+cookie =
+
+[ACCOUNT]
+login_mode = 微信登录
+username =
+password =
+wx_link =
+
+[SETTINGS]
+countdown = 10
+offset = 30
+random_deviation = 1
+interval_preset = 标准
+interval_min = 1.0
+interval_max = 3.0
+time_schedule = 0
+start_time = 08:00
+end_time = 18:00
+log_mode = 精简
+sign_mode = 过半签到
+half_sign_safety = 1
+safety_seconds = 5
