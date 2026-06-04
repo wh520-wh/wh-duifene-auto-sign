@@ -17,7 +17,7 @@
 本项目在功能与流程上**部分参考了上游开源项目**：
 👉 [liuzhijie443/duifene_auto_sign](https://github.com/liuzhijie443/duifene_auto_sign)
 
-实际签到流程的请求、解析、调度逻辑完全为本项目独立实现；上游项目仅提供了微信 OAuth 引导链接供参考。
+实际签到流程的请求、解析、调度逻辑为本项目独立实现.
 
 ---
 
