@@ -107,16 +107,15 @@ pyinstaller 对分易自动签到.spec
 
 ## ⚙️ 配置文件
 
-首次运行会在同目录生成 `duifenyi.ini`，包含账号、Cookie、监听参数等。**示例模板见 [`config.ini.example`](./config.ini.example)**。
+首次运行会在同目录生成 `duifenyi.ini`，包含账号、Cookie（很快过期）、监听参数等。**示例模板见 [`config.ini.example`](./config.ini.example)**。
 
 ```ini
 [ACCOUNT]
-login_mode = 微信登录   # 微信登录 / 账号登录
+login_mode = 微信登录   # 微信（链接）登录 / 账号登录
 username =
 password =
-wx_link =
 
-[SETTINGS]
+[SETTINGS]（不一定真实在前端使用）
 countdown = 10          # 倒计时阈值（秒）
 offset = 30             # 位置签到偏移（米）
 random_deviation = 1    # 是否启用随机抖动 0/1
@@ -144,15 +143,12 @@ wh duifene-auto-sign/
 ├── 对分易自动签到_Pro.spec  # PyInstaller 打包配置（Pro 版）
 ├── logo.ico                 # 程序图标
 ├── config.ini.example       # 配置模板（提交到仓库）
-├── README.md                # 本文件
-├── .gitignore               # Git 忽略规则
+├── README.md                # 本文件             
 └── _archive/                # 本地备份（不提交）
     ├── config.ini.bak
     ├── duifenyi.ini.bak
     └── secret.key.bak
 ```
-
-> 🔒 `_archive/`、`*.ini`（真实配置）、`data/`、`build/`、`dist/` 已被 `.gitignore` 排除，**真实账号与 Cookie 不会被推送到公开仓库**。
 
 ---
 
