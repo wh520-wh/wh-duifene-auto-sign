@@ -33,7 +33,7 @@
 | **布尔配置丢失修复** | 之前版本偶发将 `True/False` 写入 ini 后下次读回变成 `0/1` 导致逻辑错误，现已统一序列化方式 |
 | **高刷监听节流** | 默认 1.0 – 3.0 秒随机间隔，避开 5 月新增的请求频率检测；提供「快速 / 标准 / 省电」三档预设 |
 | **定时窗口** | 可设置「仅在 8:00 – 18:00 监听」，防止非上课时段被风控标记 |
-| **位置签到随机抖动** | 5 月后位置校验对固定坐标更敏感，自动注入 ±0.000089 度的随机偏移 |
+| **定位签到** | 仅在课程为「定位签到」类型时触发，按你预设的「坐标1/坐标2」原样提交经纬度（签到日志会打印实际使用的坐标，便于核对是否生效）。坐标随机抖动为计划中功能，当前版本未启用 |
 | **过半签到模式** | 监听全班签到人数，达到半数后才自动签到（🚧 正在编写中，暂未启用） |
 
 > 💡 如果你在 5 月之前使用过本项目，**请直接拉取最新 `main.py` 覆盖即可**，无需改动 ini 配置。
@@ -43,15 +43,14 @@
 ## ✨ 功能特性
 
 - ✅ **微信链接登录** / **账号密码登录**（双模式）
-- ✅ **二维码签到**、**签到码签到**、**位置签到**（含坐标抖动）
+- ✅ **二维码签到**、**签到码签到**、**定位签到**（定位按预设坐标提交，日志打印实际坐标）
 - ✅ **课程下拉选择**，自动加载本学期所有课程
 - ✅ **异步高刷监听**（UI 不卡顿、session 线程安全）
-- ✅ **倒计时阈值**：仅在签到倒计时剩余 ≤ N 秒时才触发，避免「抢签」
-- 🚧 **过半签到模式**：等半数同学签到后再签（**正在编写中**）
+- 🚧 **倒计时阈值** / **过半签到模式**：达到阈值/半数再签（**正在编写中，当前版本未启用**）
 - ✅ **定时窗口**：仅在指定时间段监听
 - ✅ **后台静默运行**（`pythonw` + 互斥锁防多开）
-- ✅ **配置加密保存**（`base64` + 可选 `cryptography`）
-- ✅ **桌面托盘** + 日志面板 + 实时状态条
+- ✅ **配置 base64 混淆保存**（账号/密码/Cookie 不以明文落盘；注意 base64 非加密，仅防肉眼直读）
+- ✅ **日志面板** + 实时状态条 + 24h 定时时间轴
 
 ---
 
@@ -61,7 +60,7 @@
 - **GUI**：[`customtkinter`](https://github.com/TomSchimansky/CustomTkinter) 5.2+
 - **HTTP**：[`requests`](https://requests.readthedocs.io/) 2.31+
 - **解析**：[`beautifulsoup4`](https://www.crummy.com/software/BeautifulSoup/) + `lxml`
-- **托盘**：[`pystray`](https://github.com/moses-palmer/pystray) + `Pillow`
+- **二维码解码**：[`Pillow`](https://python-pillow.org/) + [`pyzbar`](https://github.com/NaturalHistoryMuseum/pyzbar)（解析二维码签到图片）
 - **打包**：[`PyInstaller`](https://www.pyinstaller.org/) + `upx`
 - **平台**：Windows 10 / 11（依赖 `pywin32` 互斥体）
 
@@ -81,6 +80,10 @@ python -m venv .venv
 # 3. 安装依赖
 pip install -r requirements.txt
 ```
+
+> 💡 **二维码签到额外依赖**：`requirements.txt` 已包含 `pillow` 与 `pyzbar`。
+> 其中 `pyzbar` 在 **Windows** 上还需安装微软的「**Visual C++ Redistributable for Visual Studio 2013**」运行库，
+> 否则导入时会报 `FileNotFoundError: Could not find module 'libzbar-64.dll'`，导致二维码签到静默失效。
 
 ---
 
@@ -115,19 +118,22 @@ login_mode = 微信登录   # 微信（链接）登录 / 账号登录
 username =
 password =
 
-[SETTINGS]（不一定真实在前端使用）
-countdown = 10          # 倒计时阈值（秒）
-offset = 30             # 位置签到偏移（米）
-random_deviation = 1    # 是否启用随机抖动 0/1
+[SETTINGS]
 interval_preset = 标准  # 快速 / 标准 / 省电
 interval_min = 1.0
 interval_max = 3.0
 time_schedule = 0       # 是否启用定时窗口 0/1
 start_time = 08:00
 end_time = 18:00
-sign_mode = 过半签到    # 立即签到 / 过半签到
-half_sign_safety = 1    # 过半签到安全余量
-safety_seconds = 5
+log_mode = 精简         # 精简 / 详细 / 调试
+active_coord = 1        # 当前生效坐标组 1/2
+coord_jitter = 0        # 定位坐标随机抖动 0/1（开启后 ≤5 米随机偏移，默认关）
+lon_1 = 113.123456      # 坐标1 经度
+lat_1 = 23.654321       # 坐标1 纬度
+lon_2 =                 # 坐标2 经度（可空）
+lat_2 =                 # 坐标2 纬度（可空）
+selected_course_id =    # 上次选中的课程ID（程序自动维护）
+selected_course_name =  # 上次选中的课程名（程序自动维护）
 ```
 
 ---
