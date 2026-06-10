@@ -123,9 +123,12 @@ class DuifenyiApp(ctk.CTk):
 
         self.check_interval_min = 1.0
         self.check_interval_max = 3.0
-        self.sign_trigger_seconds = 30  # 检测到签到后延迟多少秒再触发
+        # 注:本字段为历史占位,运行期不再读取。真实延迟阈值以输入框/配置为准(空或0=立即),
+        #     启动监听时定格到 _active_trigger_seconds;此初值 30 不代表默认行为。
+        self.sign_trigger_seconds = 30  # (占位,未参与实际签到逻辑)
         self._countdown_logged = set()  # 避免同一秒数重复刷屏,只在剩余秒数变化时记录一次
-        self._monitor_start_time = None  # 启动监听时的时间戳,用于过滤历史签到
+        # 注:当前仅在启动时记录,尚未用于历史签到过滤(预留字段),不影响现有逻辑
+        self._monitor_start_time = None  # 启动监听时的时间戳(预留:历史签到过滤)
         self._scheduled_signs = {}  # API无结束时间时的回退机制:{HFC_ID: (HFC_type, check_code, sign_type, target_ts)}
         self._qr_first_seen = {}  # 二维码签到条目首次进入 pending 的时间戳,用于延迟签到判断
         self._expired_signs = set()  # 已识别的过期/无效签到 ID 指纹,避免每轮轮询重复报错
@@ -151,6 +154,7 @@ class DuifenyiApp(ctk.CTk):
         self.schedule_memory_cleanup()
         self.check_schedule_timer()
         self.after(100, self.update_timeline_display)
+        self.after(400, self._check_optional_deps)  # 启动自检二维码依赖,缺失则显式告警
 
     def set_window_icon(self):
         icon_path = resource_path("logo.ico")
@@ -352,67 +356,31 @@ class DuifenyiApp(ctk.CTk):
                      text_color="#9CA3AF",
                      font=ctk.CTkFont(size=10)).pack(side="left", padx=(4, 0))
 
-        # 定位签到坐标输入（三组坐标可选）
-        loc_frame1 = ctk.CTkFrame(basic_card, fg_color="transparent")
-        loc_frame1.pack(fill="x", padx=12, pady=(8, 3))
-        self.coord_radio_var = ctk.StringVar(value="1")
-        ctk.CTkRadioButton(loc_frame1, text="坐标1", variable=self.coord_radio_var,
-                           value="1", width=70, height=20,
-                           fg_color="#D97706", hover_color="#B45309",
-                           text_color="#1A1A1A",
-                           command=self._snapshot_coords).pack(side="left")
-        self.lon_entry_1 = ctk.CTkEntry(loc_frame1, width=90, height=26, placeholder_text="经度",
-                                        fg_color="#FFFFFF", border_color="#E8E5E0",
-                                        corner_radius=6,
-                                        text_color="#1A1A1A", placeholder_text_color="#9CA3AF")
-        self.lon_entry_1.pack(side="left", padx=(4, 3))
-        self.lon_entry_1.insert(0, self.preset_lon_1)
-        self.lat_entry_1 = ctk.CTkEntry(loc_frame1, width=90, height=26, placeholder_text="纬度",
-                                        fg_color="#FFFFFF", border_color="#E8E5E0",
-                                        corner_radius=6,
-                                        text_color="#1A1A1A", placeholder_text_color="#9CA3AF")
-        self.lat_entry_1.pack(side="left", padx=(3, 0))
-        self.lat_entry_1.insert(0, self.preset_lat_1)
+        # 定位签到坐标（支持自定义新增 / 命名 / 改名 / 删除，全部持久化保存）
+        coord_header = ctk.CTkFrame(basic_card, fg_color="transparent")
+        coord_header.pack(fill="x", padx=12, pady=(10, 0))
+        ctk.CTkLabel(coord_header, text="定位坐标", text_color="#1A1A1A",
+                     anchor="w", font=ctk.CTkFont(family="Microsoft YaHei UI",
+                                                  size=12, weight="bold")).pack(side="left")
+        ctk.CTkLabel(coord_header, text="选中圆点为生效坐标", text_color="#9CA3AF",
+                     font=ctk.CTkFont(size=10)).pack(side="right")
 
-        loc_frame2 = ctk.CTkFrame(basic_card, fg_color="transparent")
-        loc_frame2.pack(fill="x", padx=12, pady=3)
-        ctk.CTkRadioButton(loc_frame2, text="坐标2", variable=self.coord_radio_var,
-                           value="2", width=70, height=20,
-                           fg_color="#D97706", hover_color="#B45309",
-                           text_color="#1A1A1A",
-                           command=self._snapshot_coords).pack(side="left")
-        self.lon_entry_2 = ctk.CTkEntry(loc_frame2, width=90, height=26, placeholder_text="经度",
-                                        fg_color="#FFFFFF", border_color="#E8E5E0",
-                                        corner_radius=6,
-                                        text_color="#1A1A1A", placeholder_text_color="#9CA3AF")
-        self.lon_entry_2.pack(side="left", padx=(4, 3))
-        self.lon_entry_2.insert(0, self.preset_lon_2)
-        self.lat_entry_2 = ctk.CTkEntry(loc_frame2, width=90, height=26, placeholder_text="纬度",
-                                        fg_color="#FFFFFF", border_color="#E8E5E0",
-                                        corner_radius=6,
-                                        text_color="#1A1A1A", placeholder_text_color="#9CA3AF")
-        self.lat_entry_2.pack(side="left", padx=(3, 0))
-        self.lat_entry_2.insert(0, self.preset_lat_2)
+        # 坐标数据权威来源:[{"name","lon","lat"}];UI 行控件镜像存于 coord_row_widgets
+        self.coord_radio_var = ctk.StringVar(value="0")
+        self.coords = [
+            {"name": "坐标1", "lon": self.preset_lon_1, "lat": self.preset_lat_1},
+            {"name": "坐标2", "lon": self.preset_lon_2, "lat": self.preset_lat_2},
+            {"name": "坐标3", "lon": self.preset_lon_3, "lat": self.preset_lat_3},
+        ]
+        self.coord_row_widgets = []
+        self.coord_list_frame = ctk.CTkFrame(basic_card, fg_color="transparent")
+        self.coord_list_frame.pack(fill="x", padx=12, pady=(4, 2))
 
-        loc_frame3 = ctk.CTkFrame(basic_card, fg_color="transparent")
-        loc_frame3.pack(fill="x", padx=12, pady=3)
-        ctk.CTkRadioButton(loc_frame3, text="坐标3", variable=self.coord_radio_var,
-                           value="3", width=70, height=20,
-                           fg_color="#D97706", hover_color="#B45309",
-                           text_color="#1A1A1A",
-                           command=self._snapshot_coords).pack(side="left")
-        self.lon_entry_3 = ctk.CTkEntry(loc_frame3, width=90, height=26, placeholder_text="经度",
-                                        fg_color="#FFFFFF", border_color="#E8E5E0",
-                                        corner_radius=6,
-                                        text_color="#1A1A1A", placeholder_text_color="#9CA3AF")
-        self.lon_entry_3.pack(side="left", padx=(4, 3))
-        self.lon_entry_3.insert(0, self.preset_lon_3)
-        self.lat_entry_3 = ctk.CTkEntry(loc_frame3, width=90, height=26, placeholder_text="纬度",
-                                        fg_color="#FFFFFF", border_color="#E8E5E0",
-                                        corner_radius=6,
-                                        text_color="#1A1A1A", placeholder_text_color="#9CA3AF")
-        self.lat_entry_3.pack(side="left", padx=(3, 0))
-        self.lat_entry_3.insert(0, self.preset_lat_3)
+        self.add_coord_btn = ctk.CTkButton(
+            basic_card, text="＋ 新增坐标", command=self.add_coord,
+            height=28, fg_color="#F5F4F0", hover_color="#E8E5E0",
+            text_color="#1A1A1A", corner_radius=6, font=ctk.CTkFont(size=11))
+        self.add_coord_btn.pack(fill="x", padx=12, pady=(2, 6))
 
         jitter_frame = ctk.CTkFrame(basic_card, fg_color="transparent")
         jitter_frame.pack(fill="x", padx=12, pady=(2, 12))
@@ -422,6 +390,7 @@ class DuifenyiApp(ctk.CTk):
             button_color="#D97706", progress_color="#B45309",
             text_color="#6B6560", font=ctk.CTkFont(size=11))
         self.coord_jitter_switch.pack(side="left")
+        self.render_coord_list()
 
         self.advanced_card = ctk.CTkFrame(left_panel, **card_kwargs)
         self.advanced_card.pack(fill="x", padx=6, pady=6)
@@ -607,11 +576,7 @@ class DuifenyiApp(ctk.CTk):
                                       font=ctk.CTkFont(family="Microsoft YaHei UI", size=13))
         self.save_btn.pack(side="left", padx=(0, 6), pady=6)
 
-        # 坐标输入框编辑时同步刷新快照（保证后台线程读到的是最新值）
-        for _coord_entry in (self.lon_entry_1, self.lat_entry_1,
-                             self.lon_entry_2, self.lat_entry_2,
-                             self.lon_entry_3, self.lat_entry_3):
-            _coord_entry.bind("<KeyRelease>", self._snapshot_coords)
+        # 坐标行的 KeyRelease 同步在 render_coord_list() 内逐行绑定
 
         self.show_welcome()
         self.refresh_overview()
@@ -684,13 +649,25 @@ class DuifenyiApp(ctk.CTk):
             course_text = "等待登录"
         login_mode = self.login_mode.get().strip() if hasattr(self, "login_mode") and self.login_mode.get() else "微信登录"
         login_mode = self.normalize_login_mode(login_mode)
-        interval_min = self.interval_min_entry.get().strip() if hasattr(self, "interval_min_entry") else "1.0"
-        interval_max = self.interval_max_entry.get().strip() if hasattr(self, "interval_max_entry") else "3.0"
-        interval_text = f"{interval_min or '1.0'} - {interval_max or '3.0'} 秒"
+        if self.is_monitoring:
+            # 监听中显示启动时锁定生效的轮询值,而非可能已被改动的输入框值
+            interval_text = f"{self.check_interval_min} - {self.check_interval_max} 秒（已锁定）"
+        else:
+            interval_min = self.interval_min_entry.get().strip() if hasattr(self, "interval_min_entry") else "1.0"
+            interval_max = self.interval_max_entry.get().strip() if hasattr(self, "interval_max_entry") else "3.0"
+            interval_text = f"{interval_min or '1.0'} - {interval_max or '3.0'} 秒"
         start_text = f"{self.start_hour.get()}:{self.start_minute.get()}" if hasattr(self, "start_hour") else "--:--"
         end_text = f"{self.end_hour.get()}:{self.end_minute.get()}" if hasattr(self, "end_hour") else "--:--"
         schedule_text = f"{start_text} - {end_text}" if self.time_schedule_enabled else "未启用"
-        coord = self.coord_radio_var.get() if hasattr(self, "coord_radio_var") else "1"
+        # 概览显示生效坐标名称(而非内部索引)
+        coord_name = "坐标1"
+        try:
+            if getattr(self, "coords", None):
+                ci = int(self.coord_radio_var.get())
+                if 0 <= ci < len(self.coords):
+                    coord_name = self.coords[ci].get("name", f"坐标{ci + 1}")
+        except (ValueError, TypeError):
+            pass
         if self.is_monitoring:
             state_text = "正在监控当前课程"
         elif self.waiting_for_schedule:
@@ -712,7 +689,7 @@ class DuifenyiApp(ctk.CTk):
         }
         badge_bg, badge_fg = styles.get(state_text, ("#F3F4F6", "#374151"))
         self.summary_hint_label.configure(
-            text=f"{state_text} | 坐标{coord} | 轮询 {interval_text}",
+            text=f"{state_text} ｜ {coord_name} ｜ 轮询 {interval_text}",
             fg_color=badge_bg, text_color=badge_fg)
 
     def switch_login_mode(self, value):
@@ -874,7 +851,8 @@ class DuifenyiApp(ctk.CTk):
         self.ui_call(self._render_log, level, msg)
 
     def _render_log(self, level, msg):
-        self.text_box._textbox.tag_remove(self._live_log_tag, "1.0", "end")
+        # 先抹掉当前活动行(心跳/倒计时等),让普通日志成为最底部的历史行
+        self._drop_live_line()
         if self.log_line_count >= self.max_log_lines:
             self.text_box._textbox.delete("1.0", "50.0")
             self.log_line_count -= 50
@@ -892,10 +870,41 @@ class DuifenyiApp(ctk.CTk):
             self.text_box._textbox.tag_add(level, f"{line_count - 1}.0", f"{line_count}.0")
         self.text_box.see("end")
 
+    def _drop_live_line(self):
+        """删除当前"活动行"。心跳/排期等待/限流/倒计时统一用 _live_log_tag 标记,
+        只占文本框最后一行、不计入 log_line_count。删除时按 tag 范围精确定位,
+        因此绝不会误伤历史日志及其颜色 tag。"""
+        try:
+            ranges = self.text_box._textbox.tag_ranges(self._live_log_tag)
+            if ranges:
+                self.text_box._textbox.delete(ranges[0], ranges[-1])
+                self.text_box._textbox.tag_remove(self._live_log_tag, "1.0", "end")
+        except Exception:
+            pass
+
+    def _render_live_line(self, level, text):
+        """渲染"活动行":原地替换最后一行,不累积、不计入历史行数。
+        历史日志的颜色 tag 完全不受影响(被替换的只是 _live_log_tag 标记的那一行)。"""
+        self._drop_live_line()
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        line = f"{timestamp}  │ {text}\n"
+        self.text_box.insert("end", line)
+        line_no = int(self.text_box.index('end-1c').split('.')[0]) - 1
+        # 整行打 _live_log_tag 供下次定位删除;颜色用 level,分隔符 │ 单独染色
+        self.text_box._textbox.tag_add(self._live_log_tag, f"{line_no}.0", f"{line_no + 1}.0")
+        self.text_box._textbox.tag_add("ts_sep", f"{line_no}.9", f"{line_no}.12")
+        if level in ("success", "error", "warning", "info", "schedule", "highlight", "debug", "detail"):
+            self.text_box._textbox.tag_add(level, f"{line_no}.0", f"{line_no + 1}.0")
+        self.text_box.see("end")
+
     def log_celebration(self, title, subtitle=""):
         """签到成功专用：上分隔线 + 居中标题 + 副标题 + 下分隔线"""
+        # 后台签到线程会直接调用本方法,统一转发回 UI 线程执行,避免跨线程操作 Tk 崩溃
+        if threading.get_ident() != self._ui_thread_id:
+            self.ui_call(self.log_celebration, title, subtitle)
+            return
         bar = "━" * 38
-        self.text_box._textbox.tag_remove(self._live_log_tag, "1.0", "end")
+        self._drop_live_line()
         if self.log_line_count >= self.max_log_lines:
             self.text_box._textbox.delete("1.0", "50.0")
             self.log_line_count -= 50
@@ -915,42 +924,30 @@ class DuifenyiApp(ctk.CTk):
         self.text_box.see("end")
 
     def update_last_line(self, text, level="info"):
+        """心跳/排期等待/限流提示统一入口:作为"活动行"原地刷新,只占最后一行。
+        不再全量重建文本框,因此历史日志的颜色 tag 不会被抹掉。"""
         try:
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            # 心跳行与普通日志行格式统一:时间戳 + │ 分隔 + 消息
-            new_line = f"{timestamp}  │ {text}"
-            content = self.text_box.get("1.0", "end-1c")
-            lines = content.split("\n")
-            # 删除所有旧心跳行(可能不止一行),确保心跳永远只占最后一行
-            lines = [ln for ln in lines
-                     if "持续异步监控中" not in ln and "持续监控中" not in ln]
-            # 关键:剥掉尾部空行。其它日志以 \n 结尾,get(end-1c) 会带出尾部空串,
-            # split 后产生空元素,若不清理会在每次心跳重建时累积成空白行。
-            while lines and lines[-1].strip() == "":
-                lines.pop()
-            lines.append(new_line)
-            self.text_box.delete("1.0", "end")
-            self.text_box.insert("1.0", "\n".join(lines) + "\n")
-            self.text_box.see("end")
+            self._render_live_line(level, text)
         except Exception:
             self._render_log(level, text)
 
     def log_countdown(self, seconds_left, sign_type):
-        """倒计时专用:⏰ 距离触发还剩 XX 秒,XX 红色加粗。
-        整行一次性插入(原子),避免多段 insert 被其它日志插入打断导致断行。"""
+        """倒计时活动行:⏰ 距离触发还剩 XX 秒,数字红色加粗,原地刷新只占一行。
+        后台线程调用时统一转发回 UI 线程,避免跨线程操作 Tk。"""
+        if threading.get_ident() != self._ui_thread_id:
+            self.ui_call(self.log_countdown, seconds_left, sign_type)
+            return
         try:
+            self._drop_live_line()
             timestamp = datetime.now().strftime("%H:%M:%S")
             num_str = str(int(seconds_left))
             prefix = f"{timestamp}  │ ⏰ 距离触发还剩 "
             full_line = f"{prefix}{num_str} 秒 [{sign_type}]\n"
-            self.text_box._textbox.tag_remove(self._live_log_tag, "1.0", "end")
-            if self.log_line_count >= self.max_log_lines:
-                self.text_box._textbox.delete("1.0", "50.0")
-                self.log_line_count -= 50
             self.text_box.insert("end", full_line)
-            self.log_line_count += 1
             line_no = int(self.text_box.index('end-1c').split('.')[0]) - 1
             num_col = len(prefix)
+            # 活动行整行打 _live_log_tag(供下次定位删除),不计入 log_line_count
+            self.text_box._textbox.tag_add(self._live_log_tag, f"{line_no}.0", f"{line_no + 1}.0")
             self.text_box._textbox.tag_add("ts_sep", f"{line_no}.9", f"{line_no}.12")
             self.text_box._textbox.tag_add("info", f"{line_no}.0", f"{line_no + 1}.0")
             self.text_box._textbox.tag_add("countdown_num",
@@ -1089,6 +1086,7 @@ class DuifenyiApp(ctk.CTk):
 
     def save_config(self):
         try:
+            self._sync_coords_from_widgets()  # 先把坐标行控件值写回 self.coords(权威数据)
             self.config['ACCOUNT'] = {
                 'login_mode': self.login_mode.get(),
                 'username': base64.b64encode(self.username_entry.get().encode()).decode(),
@@ -1103,24 +1101,50 @@ class DuifenyiApp(ctk.CTk):
                 'start_time': f"{self.start_hour.get()}:{self.start_minute.get()}",
                 'end_time': f"{self.end_hour.get()}:{self.end_minute.get()}",
                 'log_mode': self.log_mode_btn.get(),
-                'active_coord': self.coord_radio_var.get(),
+                # 旧键双写:前三个坐标 + 生效项写回旧字段,保证回退到旧版程序配置仍可用
+                'active_coord': self._legacy_active_coord(),
                 'coord_jitter': "1" if self.coord_jitter_switch.get() else "0",
-                'lon_1': self.lon_entry_1.get().strip(),
-                'lat_1': self.lat_entry_1.get().strip(),
-                'lon_2': self.lon_entry_2.get().strip(),
-                'lat_2': self.lat_entry_2.get().strip(),
-                'lon_3': self.lon_entry_3.get().strip(),
-                'lat_3': self.lat_entry_3.get().strip(),
+                'lon_1': self._coord_get(0, "lon"),
+                'lat_1': self._coord_get(0, "lat"),
+                'lon_2': self._coord_get(1, "lon"),
+                'lat_2': self._coord_get(1, "lat"),
+                'lon_3': self._coord_get(2, "lon"),
+                'lat_3': self._coord_get(2, "lat"),
                 'selected_course_id': str(Course.id or ""),
                 'selected_course_name': self.combo.get().strip() if self.combo.get() else "",
                 'sign_trigger_seconds': self._read_trigger_seconds()
             }
+            self._write_coords_section()  # 新的多坐标段(权威来源)
             self.write_config_file()
             self.log("success", "✅ 所有配置参数已全量保存")
             self.save_btn.configure(text="✓ 已保存", fg_color="#059669")
             self.after(1500, lambda: self.save_btn.configure(text="💾 保存配置", fg_color="#F5F4F0"))
         except Exception as e:
             self.log("error", f"❌ 保存配置失败: {e}")
+
+    def _coord_get(self, i, key):
+        return self.coords[i].get(key, "") if 0 <= i < len(self.coords) else ""
+
+    def _legacy_active_coord(self):
+        """旧版 active_coord 语义为 "1"/"2"/"3";新 active_index<3 时映射,否则回退 "1"。"""
+        try:
+            idx = int(self.coord_radio_var.get())
+        except (ValueError, TypeError):
+            idx = 0
+        return str(idx + 1) if 0 <= idx < 3 else "1"
+
+    def _write_coords_section(self):
+        """把全部坐标写入 [COORDS] 段。名称用 base64(避免中文/特殊字符干扰 ini 取值)。"""
+        try:
+            idx = int(self.coord_radio_var.get())
+        except (ValueError, TypeError):
+            idx = 0
+        section = {"count": str(len(self.coords)), "active_index": str(max(0, idx))}
+        for i, c in enumerate(self.coords):
+            section[f"name_{i}"] = base64.b64encode(c.get("name", "").encode()).decode()
+            section[f"lon_{i}"] = c.get("lon", "")
+            section[f"lat_{i}"] = c.get("lat", "")
+        self.config['COORDS'] = section
 
     def _read_trigger_seconds(self):
         return str(self._get_live_trigger_seconds())
@@ -1159,8 +1183,12 @@ class DuifenyiApp(ctk.CTk):
                     self.interval_max_entry.delete(0, "end")
                     self.interval_max_entry.insert(
                         0, self.config.get('SETTINGS', 'interval_max', fallback='3.0'))
-                    self.check_interval_min = float(self.interval_min_entry.get())
-                    self.check_interval_max = float(self.interval_max_entry.get())
+                    try:
+                        self.check_interval_min = float(self.interval_min_entry.get())
+                        self.check_interval_max = float(self.interval_max_entry.get())
+                    except (ValueError, TypeError):
+                        # 坏值不中断后续配置加载(坐标/课程/延迟阈值仍能正常读入)
+                        self.check_interval_min, self.check_interval_max = 1.0, 3.0
                     if self.config.get('SETTINGS', 'time_schedule', fallback='0') in ('1', 'True', 'true'):
                         self.schedule_switch.select()
                         self.time_schedule_enabled = True
@@ -1178,34 +1206,9 @@ class DuifenyiApp(ctk.CTk):
                     log_m = self.config.get('SETTINGS', 'log_mode', fallback='精简')
                     self.log_mode_btn.set(log_m)
                     self.switch_log_mode(log_m)
-                    self.coord_radio_var.set(
-                        self.config.get('SETTINGS', 'active_coord', fallback='1'))
                     if self.config.get('SETTINGS', 'coord_jitter', fallback='0') in ('1', 'True', 'true'):
                         self.coord_jitter_switch.select()
-                    lon1 = self.config.get('SETTINGS', 'lon_1', fallback='')
-                    lat1 = self.config.get('SETTINGS', 'lat_1', fallback='')
-                    lon2 = self.config.get('SETTINGS', 'lon_2', fallback='')
-                    lat2 = self.config.get('SETTINGS', 'lat_2', fallback='')
-                    lon3 = self.config.get('SETTINGS', 'lon_3', fallback='')
-                    lat3 = self.config.get('SETTINGS', 'lat_3', fallback='')
-                    if lon1:
-                        self.lon_entry_1.delete(0, "end")
-                        self.lon_entry_1.insert(0, lon1)
-                    if lat1:
-                        self.lat_entry_1.delete(0, "end")
-                        self.lat_entry_1.insert(0, lat1)
-                    if lon2:
-                        self.lon_entry_2.delete(0, "end")
-                        self.lon_entry_2.insert(0, lon2)
-                    if lat2:
-                        self.lat_entry_2.delete(0, "end")
-                        self.lat_entry_2.insert(0, lat2)
-                    if lon3:
-                        self.lon_entry_3.delete(0, "end")
-                        self.lon_entry_3.insert(0, lon3)
-                    if lat3:
-                        self.lat_entry_3.delete(0, "end")
-                        self.lat_entry_3.insert(0, lat3)
+                    # 坐标列表的加载/迁移统一放到方法末尾的 _load_coords_from_config()
                     self._saved_course_id = self.config.get('SETTINGS', 'selected_course_id', fallback='')
                     try:
                         loaded_trigger = int(self.config.get('SETTINGS', 'sign_trigger_seconds', fallback='0'))
@@ -1217,10 +1220,66 @@ class DuifenyiApp(ctk.CTk):
                         # 0 或空都保持输入框为空,代表"立即签到"
                         self.trigger_entry.delete(0, "end")
                         self.trigger_entry.insert(0, str(loaded_trigger))
+                # 坐标:优先读新 [COORDS] 段,否则从旧 lon_1~lat_3/active_coord 迁移
+                try:
+                    self._load_coords_from_config()
+                except Exception:
+                    pass
                 self.refresh_overview()
         except Exception as e:
             if self.log_mode == "debug":
                 self.log("debug", f"load_config 异常: {type(e).__name__}: {e}")
+
+    def _load_coords_from_config(self):
+        """加载坐标:优先 [COORDS] 段;若无则从旧 SETTINGS(lon_1~lat_3/active_coord)迁移。
+        迁移时空值回退到内置预设,保持与旧版默认一致。"""
+        coords = []
+        active_index = 0
+        if self.config.has_section('COORDS'):
+            try:
+                count = int(self.config.get('COORDS', 'count', fallback='0'))
+            except (ValueError, TypeError):
+                count = 0
+            for i in range(max(0, count)):
+                name_raw = self.config.get('COORDS', f'name_{i}', fallback='')
+                try:
+                    name = base64.b64decode(name_raw.encode()).decode() if name_raw else ''
+                except Exception:
+                    name = name_raw
+                coords.append({
+                    "name": name or f"坐标{i + 1}",
+                    "lon": self.config.get('COORDS', f'lon_{i}', fallback=''),
+                    "lat": self.config.get('COORDS', f'lat_{i}', fallback=''),
+                })
+            try:
+                active_index = int(self.config.get('COORDS', 'active_index', fallback='0'))
+            except (ValueError, TypeError):
+                active_index = 0
+        if not coords:
+            # 迁移旧三坐标
+            lon1 = self.config.get('SETTINGS', 'lon_1', fallback='') or self.preset_lon_1
+            lat1 = self.config.get('SETTINGS', 'lat_1', fallback='') or self.preset_lat_1
+            lon2 = self.config.get('SETTINGS', 'lon_2', fallback='') or self.preset_lon_2
+            lat2 = self.config.get('SETTINGS', 'lat_2', fallback='') or self.preset_lat_2
+            lon3 = self.config.get('SETTINGS', 'lon_3', fallback='') or self.preset_lon_3
+            lat3 = self.config.get('SETTINGS', 'lat_3', fallback='') or self.preset_lat_3
+            coords = [
+                {"name": "坐标1", "lon": lon1, "lat": lat1},
+                {"name": "坐标2", "lon": lon2, "lat": lat2},
+                {"name": "坐标3", "lon": lon3, "lat": lat3},
+            ]
+            ac = self.config.get('SETTINGS', 'active_coord', fallback='1')
+            try:
+                active_index = max(0, min(int(ac) - 1, 2))
+            except (ValueError, TypeError):
+                active_index = 0
+        if not coords:
+            return
+        if active_index < 0 or active_index >= len(coords):
+            active_index = 0
+        self.coords = coords
+        self.coord_radio_var.set(str(active_index))
+        self.render_coord_list()
 
     def copy_wx_link(self):
         self.clipboard_clear()
@@ -1231,7 +1290,7 @@ class DuifenyiApp(ctk.CTk):
         link = self.link_entry.get()
         code = self.extract_wechat_code(link)
         if not code:
-            messagebox.showerror("error", "链接有误")
+            messagebox.showerror("错误", "微信链接有误，请重新复制粘贴")
             return
         self.wx_login_btn.configure(state="disabled", text="登录中...")
         threading.Thread(target=self._login_link_task, args=(code,), daemon=True).start()
@@ -1590,16 +1649,23 @@ class DuifenyiApp(ctk.CTk):
                 continue
             if self.log_mode == "debug":
                 self.log("debug", f"⏰ 排期到期,执行{sign_type}签到")
-            self._do_sign_with_log(hid, HFC_type, check_code, sign_type, pending=None)
+            result = self._do_sign_with_log(hid, HFC_type, check_code, sign_type, pending=None)
+            if result == "ratelimit":
+                # 限流:保留原 entry(含原 target_ts)回插排期,延迟倒计时不从头重置,
+                #       下一轮到点继续尝试。其余限流退避流程保持现状。
+                self._scheduled_signs[hid] = entry
+                continue
             if hid in Course.check_list and hid not in self._expired_signs:
-                # 签到成功,清掉剩余排期
+                # 签到成功,清掉剩余排期与倒计时去重缓存
                 self._scheduled_signs.clear()
+                self._countdown_logged.clear()
                 return
         # 所有 ready 的都失败/被指纹了,继续正常轮询
 
     def _do_sign_with_log(self, HFC_ID, HFC_type, check_code, sign_type, pending):
         """统一的签到入口,负责日志、成功/失败/限流的分支处理。
-        设计原则:成功才庆祝,失败(过期/无效码)完全静默指纹掉,用户日志里只看到成功。"""
+        设计原则:成功才庆祝,失败(过期/无效码)完全静默指纹掉,用户日志里只看到成功。
+        返回 "success"/"ratelimit"/"expired"/"error",供排期路径决定是否回插。"""
         try:
             status = self._do_sign(HFC_type, check_code, HFC_ID)
             if status == True:
@@ -1610,18 +1676,22 @@ class DuifenyiApp(ctk.CTk):
                             oid = other.get("ID", "")
                             if oid and oid not in Course.check_list:
                                 Course.check_list.append(oid)
+                return "success"
             elif status == "ratelimit":
                 self.ui_call(self.update_last_line, "⏳ 频率限制，6秒后重试", "detail")
                 self.ui_after(6000, self.watching_sign)
+                return "ratelimit"
             else:
                 # False / "expired" / 其它:静默指纹,不打日志,下一轮不再处理
                 Course.check_list.append(HFC_ID)
                 self._expired_signs.add(HFC_ID)
+                return "expired"
         except Exception as e:
             if self.log_mode == "debug":
                 self.log("debug", f"⚠️ 签到处理异常: {e}")
             Course.check_list.append(HFC_ID)
             self._expired_signs.add(HFC_ID)
+            return "error"
 
     def _qr_probe_cooldown(self):
         """每5次轮询探测一次二维码，避免频繁请求"""
@@ -1635,8 +1705,14 @@ class DuifenyiApp(ctk.CTk):
 
     def _probe_qr_sign(self):
         """主动探测：先确认有活跃 QR 签到实例，再调 getcodeimage 获取 state"""
+        # 停止监控后(手动停止/定时结束)在途探测线程不得再发起签到
+        if not (self.is_monitoring and Course.flag):
+            return
         try:
             # 第一步：用轮询接口确认当前确实有活跃的 QR 签到（type=2, StatusID=2）
+            # 注:此 gate 要求 rows 里能看到 QR 条目;而能进入探测分支的前提恰是主轮询 rows 中
+            #     没有 QR,故该 gate 会让"纯靠图片接口兜底"的场景几乎失效。在缺乏 2026 机制的
+            #     真实抓包验证前保守保留现状(改动会触及签到探测的请求行为)。
             with self._session_lock:
                 _r = self.x.post(
                     url=f"{self.host}/_CheckIn/MBCount.ashx",
@@ -1670,7 +1746,7 @@ class DuifenyiApp(ctk.CTk):
                     timeout=self.req_timeout)
             if _r.status_code == 200:
                 data = _r.json()
-                if data.get("msg") == 1 and data.get("data"):
+                if str(data.get("msg")) == "1" and data.get("data"):
                     self._handle_qr_probe_hit()
                     return
         except Exception as e:
@@ -1680,6 +1756,9 @@ class DuifenyiApp(ctk.CTk):
 
     def _handle_qr_probe_hit(self):
         """getcodeimage 探测到活跃二维码签到"""
+        # 停止监控后不得补发签到
+        if not (self.is_monitoring and Course.flag):
+            return
         # 阈值判断:首次见到二维码签到条目后,未到阈值则推迟本次签到
         threshold = getattr(self, '_active_trigger_seconds', 0)
         if threshold > 0 and self._qr_first_seen:
@@ -1749,12 +1828,24 @@ class DuifenyiApp(ctk.CTk):
             if _r.status_code != 200:
                 return False
             data = _r.json()
-            return data.get("msg") == 1 and bool(data.get("data"))
+            return str(data.get("msg")) == "1" and bool(data.get("data"))
         except Exception:
             return False
 
     def _get_qr_state(self):
         """通过 getcodeimage 获取 QR 图片并解码出 state"""
+        # 依赖自检:Pillow/pyzbar(及其 libzbar DLL)缺失时显式告警(仅一次),
+        #          不再把 ImportError 静默当作"已过期"指纹掉,导致二维码签到无声失效。
+        try:
+            import io
+            from PIL import Image
+            from pyzbar.pyzbar import decode as qr_decode
+        except Exception as e:
+            if not getattr(self, "_qr_dep_warned", False):
+                self._qr_dep_warned = True
+                self.log("error", f"⚠️ 二维码依赖缺失({type(e).__name__})，无法解码二维码签到，"
+                                  f"请安装 Pillow / pyzbar 后重启程序")
+            return None
         try:
             with self._session_lock:
                 _r = self.x.post(
@@ -1769,11 +1860,8 @@ class DuifenyiApp(ctk.CTk):
             if _r.status_code != 200:
                 return None
             data = _r.json()
-            if data.get("msg") != 1 or not data.get("data"):
+            if str(data.get("msg")) != "1" or not data.get("data"):
                 return None
-            import io
-            from PIL import Image
-            from pyzbar.pyzbar import decode as qr_decode
             qr_bytes = base64.b64decode(data["data"])
             img = Image.open(io.BytesIO(qr_bytes))
             results = qr_decode(img)
@@ -1798,23 +1886,118 @@ class DuifenyiApp(ctk.CTk):
                 self.log("debug", f"QR解码异常: {e}")
         return None
 
+    # ==================== 坐标管理（自定义新增/命名/删除/选择，持久化） ====================
+    def render_coord_list(self):
+        """根据 self.coords 重建坐标行 UI。每行:○选中 + 名称框 + 经度 + 纬度 + 删除。
+        名称/经纬度编辑只写回数据并刷新快照,不触发重建(避免输入时失焦);
+        仅新增/删除/切换选中会重建或刷新。"""
+        for child in self.coord_list_frame.winfo_children():
+            child.destroy()
+        self.coord_row_widgets = []
+        entry_kw = {"fg_color": "#FFFFFF", "border_color": "#E8E5E0", "corner_radius": 6,
+                    "text_color": "#1A1A1A", "placeholder_text_color": "#9CA3AF", "height": 26}
+        for i, c in enumerate(self.coords):
+            row = ctk.CTkFrame(self.coord_list_frame, fg_color="#F9F8F5", corner_radius=6,
+                               border_width=1, border_color="#EEECE8")
+            row.pack(fill="x", pady=3)
+            top = ctk.CTkFrame(row, fg_color="transparent")
+            top.pack(fill="x", padx=6, pady=(5, 1))
+            ctk.CTkRadioButton(top, text="", variable=self.coord_radio_var, value=str(i),
+                               width=22, radiobutton_width=18, radiobutton_height=18,
+                               fg_color="#D97706", hover_color="#B45309",
+                               command=self._snapshot_coords).pack(side="left")
+            name_entry = ctk.CTkEntry(top, placeholder_text="坐标名称", **entry_kw)
+            name_entry.pack(side="left", fill="x", expand=True, padx=(2, 4))
+            name_entry.insert(0, c.get("name", ""))
+            name_entry.bind("<KeyRelease>", self._snapshot_coords)
+            del_btn = ctk.CTkButton(top, text="🗑", width=30, height=26,
+                                    fg_color="#F5F4F0", hover_color="#FCA5A5",
+                                    text_color="#B91C1C", corner_radius=6,
+                                    command=lambda idx=i: self.delete_coord(idx))
+            del_btn.pack(side="left")
+            bottom = ctk.CTkFrame(row, fg_color="transparent")
+            bottom.pack(fill="x", padx=6, pady=(0, 5))
+            ctk.CTkLabel(bottom, text="经度", text_color="#9CA3AF",
+                         font=ctk.CTkFont(size=10), width=28, anchor="w").pack(side="left")
+            lon_entry = ctk.CTkEntry(bottom, width=92, placeholder_text="经度", **entry_kw)
+            lon_entry.pack(side="left", padx=(2, 8))
+            lon_entry.insert(0, c.get("lon", ""))
+            lon_entry.bind("<KeyRelease>", self._snapshot_coords)
+            ctk.CTkLabel(bottom, text="纬度", text_color="#9CA3AF",
+                         font=ctk.CTkFont(size=10), width=28, anchor="w").pack(side="left")
+            lat_entry = ctk.CTkEntry(bottom, width=92, placeholder_text="纬度", **entry_kw)
+            lat_entry.pack(side="left", padx=(2, 0))
+            lat_entry.insert(0, c.get("lat", ""))
+            lat_entry.bind("<KeyRelease>", self._snapshot_coords)
+            self.coord_row_widgets.append({"name": name_entry, "lon": lon_entry, "lat": lat_entry})
+        # 选中项越界则归位到第一个
+        if self.coords:
+            try:
+                idx = int(self.coord_radio_var.get())
+            except (ValueError, TypeError):
+                idx = -1
+            if idx < 0 or idx >= len(self.coords):
+                self.coord_radio_var.set("0")
+        self._snapshot_coords()
+
+    def _sync_coords_from_widgets(self):
+        """把 UI 行控件里的当前值写回 self.coords(权威数据)。"""
+        for i, w in enumerate(self.coord_row_widgets):
+            if i < len(self.coords):
+                try:
+                    name = w["name"].get().strip()
+                    self.coords[i]["name"] = name if name else f"坐标{i + 1}"
+                    self.coords[i]["lon"] = w["lon"].get().strip()
+                    self.coords[i]["lat"] = w["lat"].get().strip()
+                except Exception:
+                    continue
+
+    def add_coord(self):
+        self._sync_coords_from_widgets()
+        self.coords.append({"name": f"坐标{len(self.coords) + 1}", "lon": "", "lat": ""})
+        self.coord_radio_var.set(str(len(self.coords) - 1))  # 选中新建项
+        self.render_coord_list()
+        self.log("info", "➕ 已新增一个坐标")
+
+    def delete_coord(self, idx):
+        self._sync_coords_from_widgets()
+        if idx < 0 or idx >= len(self.coords):
+            return
+        if len(self.coords) <= 1:
+            self.log("warning", "⚠️ 至少需保留一个坐标，无法删除")
+            return
+        removed = self.coords.pop(idx)
+        try:
+            cur = int(self.coord_radio_var.get())
+        except (ValueError, TypeError):
+            cur = 0
+        if cur == idx:
+            cur = max(0, idx - 1)
+        elif cur > idx:
+            cur -= 1
+        self.coord_radio_var.set(str(cur))
+        self.render_coord_list()
+        self.log("info", f"🗑 已删除坐标「{removed.get('name', '')}」")
+
     def _snapshot_coords(self, *_):
-        """在 UI 线程把当前选中的坐标读进普通变量。
+        """在 UI 线程把当前选中的坐标读进普通变量(并先把控件值同步回 self.coords)。
         后台签到线程只读这份快照，绝不直接调用 Tk 控件的 .get()，避免跨线程崩溃。"""
         try:
-            coord = self.coord_radio_var.get()
-            if coord == "3":
-                lon = self.lon_entry_3.get().strip()
-                lat = self.lat_entry_3.get().strip()
-            elif coord == "2":
-                lon = self.lon_entry_2.get().strip()
-                lat = self.lat_entry_2.get().strip()
+            self._sync_coords_from_widgets()
+            try:
+                idx = int(self.coord_radio_var.get())
+            except (ValueError, TypeError):
+                idx = 0
+            if not self.coords:
+                self._active_coord_label, self._active_lon, self._active_lat = "", "", ""
             else:
-                lon = self.lon_entry_1.get().strip()
-                lat = self.lat_entry_1.get().strip()
-            self._active_coord_label = coord
-            self._active_lon = lon
-            self._active_lat = lat
+                if idx < 0 or idx >= len(self.coords):
+                    idx = 0
+                    self.coord_radio_var.set("0")
+                c = self.coords[idx]
+                self._active_coord_label = c.get("name", f"坐标{idx + 1}")
+                self._active_lon = c.get("lon", "")
+                self._active_lat = c.get("lat", "")
             if hasattr(self, "coord_jitter_switch"):
                 self._coord_jitter_enabled = bool(self.coord_jitter_switch.get())
         except Exception:
@@ -1842,14 +2025,14 @@ class DuifenyiApp(ctk.CTk):
         if not (lon and lat):
             self.log("warning", "⚠️ 定位签到需要预设经纬度（当前选中坐标为空，请在左侧填好经纬度）")
             return False
-        label = getattr(self, "_active_coord_label", "1")
+        label = getattr(self, "_active_coord_label", "") or "坐标"
         if getattr(self, "_coord_jitter_enabled", False):
             j_lon, j_lat = self._apply_coord_jitter(lon, lat)
-            self.log("info", f"📍 使用【坐标{label}】基准 经度={lon} 纬度={lat}；"
+            self.log("info", f"📍 使用【{label}】基准 经度={lon} 纬度={lat}；"
                              f"抖动后 经度={j_lon} 纬度={j_lat}（≤5米）提交定位签到")
             lon, lat = j_lon, j_lat
         else:
-            self.log("info", f"📍 使用【坐标{label}】经度={lon} 纬度={lat} 提交定位签到")
+            self.log("info", f"📍 使用【{label}】经度={lon} 纬度={lat} 提交定位签到")
         return self.sign_location(lon, lat)
 
     def _fetch_room_location(self):
@@ -2082,6 +2265,26 @@ class DuifenyiApp(ctk.CTk):
                 Course.class_id = i["TClassID"]
                 self._saved_course_id = str(Course.id or "")
         self.refresh_overview()
+
+    def _check_optional_deps(self):
+        """启动自检二维码签到所需的可选依赖,缺失则显式告警(不阻断程序运行)。
+        pyzbar 在 Windows 还依赖 libzbar DLL,打包时极易漏带,故单独提示。"""
+        missing = []
+        try:
+            import PIL  # noqa: F401
+        except Exception:
+            missing.append("Pillow")
+        try:
+            import pyzbar.pyzbar  # noqa: F401
+        except Exception:
+            missing.append("pyzbar")
+        try:
+            import lxml  # noqa: F401
+        except Exception:
+            missing.append("lxml")
+        if missing:
+            self.log("error", f"⚠️ 缺少依赖 {', '.join(missing)}：二维码签到可能无法使用，"
+                              f"请执行 pip install {' '.join(missing)} 后重启程序")
 
     def init(self):
         # 本地部分（建文件/读 cookie）在主线程快速完成，网络部分丢到后台线程，避免开机卡死窗口

@@ -8,8 +8,5 @@ lxml==5.2.2
 requests==2.31.0
 soupsieve==2.4.1
 urllib3==2.0.7
-# ↓ 二维码签到必需：缺失时 QR 签到会静默失效（_get_qr_state 解码二维码用）
 pillow==10.3.0
 pyzbar==0.1.9
-# 注意：pyzbar 在 Windows 上还需安装「Visual C++ Redistributable for VS 2013」运行库，
-#       否则 import 时会报 FileNotFoundError（找不到 libzbar-64.dll）。
