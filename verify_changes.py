@@ -1,7 +1,7 @@
 """离线回归检查：python verify_changes.py；不创建窗口，不发送请求。"""
 import threading
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs
@@ -17,6 +17,7 @@ METHODS = (
     '_cancel_next_watch', '_run_next_watch', '_parse_end_time',
     '_extract_remaining_seconds', '_login_task', 'sign',
     'sign_location', '_do_location_sign', '_fetch_room_location',
+    '_login_link_task', 'get_class_list', '_reset_course_selection',
 )
 Core = type('Core', (), {name: getattr(main.DuifenyiApp, name) for name in METHODS})
 
@@ -69,7 +70,7 @@ class RegressionChecks(unittest.TestCase):
     @staticmethod
     def activity(kind='1', identifier='active', **extra):
         return {'ID': identifier, 'StatusID': '2', 'CheckInType': kind,
-                'CheckInCode': '123456', **extra}
+                'CheckInCode': '1234', **extra}
 
     def poll(self, *rows):
         self.app._process_watch_result({'msg': '1', 'rows': list(rows)})
@@ -115,7 +116,7 @@ class RegressionChecks(unittest.TestCase):
         self.assertFalse(self.timers)
 
     def test_delayed_failures_and_rate_limits_keep_schedule(self):
-        entry = ('1', '123456', '签到码', datetime.now().timestamp() - 1)
+        entry = ('1', '1234', '签到码', datetime.now().timestamp() - 1)
         for result in ('retry', 'ratelimit'):
             with self.subTest(result=result):
                 self.app._scheduled_signs = {'active': entry}
@@ -244,6 +245,140 @@ class RegressionChecks(unittest.TestCase):
         self.poll(self.activity('3'))
         self.assertNotIn('active', self.app._expired_signs)
         self.assertGreaterEqual(next(iter(self.timers.values()))[0], 5990)
+
+    def prepare_wechat_login(self):
+        a = self.app
+        a.is_monitoring = False
+        a._saved_course_id = ''
+        a.combo = SimpleNamespace(configure=Mock(), set=Mock())
+        a.wx_login_btn = SimpleNamespace(configure=Mock())
+        a.refresh_overview = Mock()
+        a.update_status = Mock()
+        a.is_login = Mock(return_value=True)
+        a.config = {}
+        a.get_cookie_string = Mock(return_value='session=verified')
+        a.write_config_file = Mock()
+        a.x.get.return_value = SimpleNamespace(status_code=200)
+
+    def test_expired_wechat_link_never_reports_success(self):
+        self.prepare_wechat_login()
+        self.app.x.post.return_value = SimpleNamespace(
+            status_code=200, json=lambda: {'msgbox': '禁止访问，请重新登录'})
+        self.app._login_link_task('expired')
+        self.assertFalse(any(c.args[0] == 'success' for c in self.app.log.call_args_list))
+        self.app.write_config_file.assert_not_called()
+        self.app.combo.set.assert_called_with('请先登录')
+        self.app.wx_login_btn.configure.assert_called_with(state='normal', text='微信登录')
+
+    def test_wechat_success_requires_confirmed_session(self):
+        self.prepare_wechat_login()
+        self.app.is_login.return_value = False
+        self.app.x.post.return_value = SimpleNamespace(
+            status_code=200, json=lambda: [
+                {'CourseName': '示例课程', 'CourseID': 'c', 'TClassID': 't'}])
+        self.app._login_link_task('unverified')
+        self.assertFalse(any(c.args[0] == 'success' for c in self.app.log.call_args_list))
+        self.app.write_config_file.assert_not_called()
+
+    def test_valid_wechat_login_reports_success_and_saves_cookie(self):
+        self.prepare_wechat_login()
+        self.app.x.post.return_value = SimpleNamespace(
+            status_code=200, json=lambda: [
+                {'CourseName': '示例课程', 'CourseID': 'c', 'TClassID': 't'}])
+        self.app._login_link_task('valid')
+        self.assertEqual(sum(c.args[0] == 'success' for c in self.app.log.call_args_list), 1)
+        self.app.write_config_file.assert_called_once()
+        self.assertEqual(self.app.config['INFO']['cookie'], 'session=verified')
+
+    def test_wechat_network_failure_never_reports_success(self):
+        self.prepare_wechat_login()
+        self.app.x.get.side_effect = requests.exceptions.Timeout()
+        self.app._login_link_task('timeout')
+        self.assertFalse(any(c.args[0] == 'success' for c in self.app.log.call_args_list))
+        self.app.write_config_file.assert_not_called()
+        self.app.wx_login_btn.configure.assert_called_with(state='normal', text='微信登录')
+
+    def test_wechat_http_failure_never_reports_success(self):
+        self.prepare_wechat_login()
+        self.app.x.get.return_value = SimpleNamespace(status_code=403)
+        self.app._login_link_task('forbidden')
+        self.assertFalse(any(c.args[0] == 'success' for c in self.app.log.call_args_list))
+        self.app.write_config_file.assert_not_called()
+        self.app.x.post.assert_not_called()
+
+    def test_wechat_unknown_session_is_not_reported_as_success(self):
+        self.prepare_wechat_login()
+        self.app.is_login.return_value = None
+        self.app.x.post.return_value = SimpleNamespace(
+            status_code=200, json=lambda: [
+                {'CourseName': '示例课程', 'CourseID': 'c', 'TClassID': 't'}])
+        self.app._login_link_task('unknown')
+        self.assertFalse(any(c.args[0] == 'success' for c in self.app.log.call_args_list))
+        self.app.write_config_file.assert_not_called()
+        self.assertTrue(any('暂时无法验证' in c.args[1] for c in self.app.log.call_args_list))
+
+    def test_success_log_includes_actual_checkin_code(self):
+        self.app.sign = Core.sign.__get__(self.app)
+        self.app.x.post.return_value = SimpleNamespace(
+            status_code=200, json=lambda: {'msgbox': '签到成功'})
+        self.assertTrue(self.app.sign('0123'))
+        self.app.log_celebration.assert_called_once_with('签到成功', '签到码：0123')
+
+    def history_with_newer_attended_activity(self):
+        now = datetime.now()
+        return (
+            self.activity('1', 'newer-attended', StatusID='1',
+                          CreaterDate=(now - timedelta(minutes=5)).strftime('%Y/%m/%d %H:%M:%S')),
+            self.activity('3', 'old-location',
+                          CreaterDate=(now - timedelta(minutes=10)).strftime('%Y/%m/%d %H:%M:%S'),
+                          ApplyLimitDate=(now + timedelta(days=1)).strftime('%Y/%m/%d %H:%M:%S')),
+        )
+
+    def test_first_poll_does_not_submit_old_location_behind_attended_record(self):
+        self.app._active_lon = '113.123456'
+        self.app._active_lat = '23.654321'
+        self.app.x.post.return_value = SimpleNamespace(status_code=503)
+        self.poll(*self.history_with_newer_attended_activity())
+        self.app.x.post.assert_not_called()
+        self.assertFalse(any('提交定位签到' in c.args[1] for c in self.app.log.call_args_list))
+
+    def test_already_processed_latest_record_does_not_promote_old_record(self):
+        self.app._do_location_sign = Mock(return_value=True)
+        rows = self.history_with_newer_attended_activity()
+        rows[0]['StatusID'] = '2'
+        main.Course.check_list.append('newer-attended')
+        self.poll(*rows)
+        self.app.sign.assert_not_called()
+        self.app.x.post.assert_not_called()
+        self.app._do_location_sign.assert_not_called()
+
+    def test_obsolete_delayed_location_is_cancelled_before_submission(self):
+        self.app._active_lon = '113.123456'
+        self.app._active_lat = '23.654321'
+        self.app.x.post.return_value = SimpleNamespace(status_code=503)
+        self.app._scheduled_signs['old-location'] = (
+            '3', '', '定位', datetime.now().timestamp() - 1)
+        self.poll(*self.history_with_newer_attended_activity())
+        self.app.x.post.assert_not_called()
+        self.assertFalse(self.app._scheduled_signs)
+
+    def test_location_non_200_response_has_failure_log(self):
+        self.app.x.post.return_value = SimpleNamespace(status_code=503)
+        self.assertFalse(self.app.sign_location('113.123456', '23.654321'))
+        self.assertTrue(any(c.args[0] == 'error' and '503' in c.args[1]
+                            for c in self.app.log.call_args_list))
+
+    def test_latest_pending_location_is_not_discarded_merely_for_predating_start(self):
+        now = datetime.now()
+        self.app._monitor_start_time = now
+        self.app._active_lon = '113.123456'
+        self.app._active_lat = '23.654321'
+        self.app.x.post.return_value = SimpleNamespace(
+            status_code=200, json=lambda: {'msgbox': '签到成功'})
+        self.poll(self.activity('3', 'latest-location',
+                               CreaterDate=(now - timedelta(seconds=20)).strftime('%Y/%m/%d %H:%M:%S'),
+                               EndTime=(now + timedelta(minutes=1)).strftime('%Y/%m/%d %H:%M:%S')))
+        self.app.x.post.assert_called_once()
 
 
 if __name__ == '__main__':

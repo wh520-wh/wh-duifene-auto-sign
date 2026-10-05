@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 对分易自动签到 - 异步高刷性能版
-版本: 6.7.1
+版本: 6.7.3
 后台监控、临时失败重试、统一限流调度与二维码响应复用。
 """
 import configparser
@@ -141,7 +141,7 @@ class DuifenyiApp(ctk.CTk):
 
         self.clean_counter = 0
 
-        self.title("对分易自动签到 v6.7.1")
+        self.title("对分易自动签到 v6.7.3")
         self.set_window_icon()
         self.geometry("1120x760")
         self.minsize(940, 620)
@@ -222,7 +222,7 @@ class DuifenyiApp(ctk.CTk):
         ctk.CTkLabel(title_row, text="对分易自动签到",
                      font=ctk.CTkFont(family="Microsoft YaHei UI", size=22, weight="bold"),
                      text_color="#1A1A1A").pack(side="left", padx=(0, 12))
-        ctk.CTkLabel(title_row, text="v6.7.1",
+        ctk.CTkLabel(title_row, text="v6.7.3",
                      font=ctk.CTkFont(family="Consolas", size=11),
                      text_color="#B45309", fg_color="#FEF3C7",
                      corner_radius=4, width=44, height=22).pack(side="left", pady=(3, 0))
@@ -798,7 +798,7 @@ class DuifenyiApp(ctk.CTk):
                                 fg_color="#DC2626", hover_color="#B91C1C")
 
     def show_welcome(self):
-        self.log("highlight", "对分易自动签到 v6.7.1")
+        self.log("highlight", "对分易自动签到 v6.7.3")
         self.log("info", "在左侧登录并选择课程，然后点击「开始监听」。")
 
     def validate_number(self, value):
@@ -1338,25 +1338,60 @@ class DuifenyiApp(ctk.CTk):
         if not code:
             messagebox.showerror("错误", "微信链接有误，请重新复制粘贴")
             return
+        self._reset_course_selection()
+        self.update_status("waiting", "验证登录中")
         self.wx_login_btn.configure(state="disabled", text="登录中...")
         threading.Thread(target=self._login_link_task, args=(code,), daemon=True).start()
 
     def _login_link_task(self, code):
         """微信链接登录的网络部分，在后台线程执行，避免卡死 UI"""
-        self.x.cookies.clear()
+        verified = False
         try:
             with self._session_lock:
-                self.x.get(url=self.host + f"/P.aspx?authtype=1&code={code}&state=1",
-                           timeout=self.req_timeout)
-            self.get_class_list()
+                self.x.cookies.clear()
+                response = self.x.get(
+                    url=self.host + "/P.aspx",
+                    params={"authtype": "1", "code": code, "state": "1"},
+                    timeout=self.req_timeout)
+            if response.status_code != 200:
+                self.log("error", f"❌ 微信链接登录失败：HTTP {response.status_code}，请重新获取链接")
+                return
+            if not self.get_class_list():
+                return  # 课程接口已经给出失败原因，不再打印成功或保存 Cookie。
+            login_ok = self.is_login()
+            if login_ok is not True:
+                if login_ok is False:
+                    self.log("error", "❌ 微信链接未建立有效登录会话，请重新复制微信链接")
+                else:
+                    self.log("warning", "⚠️ 暂时无法验证微信登录状态，请检查网络后重试")
+                return
             self.config['INFO'] = {'cookie': self.get_cookie_string()}
             self.write_config_file()
+            verified = True
             self.log("success", "✅ 微信链接登录成功")
+            self.ui_call(self.update_status, "idle", "已登录")
             self.ui_call(self.refresh_overview)
         except Exception as e:
             self.log("error", f"❌ 网络请求异常: {e}")
         finally:
+            if not verified:
+                with self._session_lock:
+                    self.x.cookies.clear()
+                self.ui_call(self._reset_course_selection)
+                self.ui_call(self.update_status, "error", "登录未成功")
             self.ui_call(self.wx_login_btn.configure, state="normal", text="微信登录")
+
+    def _reset_course_selection(self):
+        """在 UI 线程清理失效会话对应的旧课程，避免继续使用旧账号上下文。"""
+        if self.is_monitoring:
+            self.stop_monitoring(manual=True)
+        Course.id = '0'
+        Course.class_id = '0'
+        Course.class_list = []
+        self._cached_uid = ""
+        self.combo.configure(values=["请先登录"])
+        self.combo.set("请先登录")
+        self.refresh_overview()
 
     def login(self):
         username = self.username_entry.get()
@@ -1408,7 +1443,7 @@ class DuifenyiApp(ctk.CTk):
                                  timeout=self.req_timeout)
             if _r.status_code == 200:
                 data = _r.json()
-                if data.get("msg") == "1":
+                if str(data.get("msg", "")) == "1":
                     return True
                 else:
                     self.log("error", f"🔒 登录状态已失效，session验证未通过")
@@ -1565,11 +1600,6 @@ class DuifenyiApp(ctk.CTk):
         if self.log_mode == "debug":
             self.log("debug", f"API原始响应: msg={data.get('msg')}({type(data.get('msg')).__name__}), rows数量={len(data.get('rows', []))}")
 
-        # 0) 先处理上一轮已排期的签到(到点了就真正发起)
-        if self._flush_scheduled_signs() == "ratelimit":
-            self._schedule_next_watch()
-            return
-
         rows = data.get("rows", [])
         has_data = str(data.get("msg", "")) == "1" and bool(rows)
 
@@ -1577,14 +1607,13 @@ class DuifenyiApp(ctk.CTk):
         if has_data:
             candidates = []
             for r in rows:
-                if str(r.get("StatusID", "")) != "2":
-                    continue
                 hid = r.get("ID", "")
-                if not hid or hid in Course.check_list or hid in self._expired_signs:
+                if not hid:
                     continue
                 candidates.append(r)
             # 业务铁律:同时只有一个签到活跃,其余检测到的都是过期残留。
-            # 取 CreaterDate 最新的一条为活跃签到,其余静默指纹掉,不进倒计时。
+            # 沿用旧版取最新一条的规则，但必须先看全部记录：
+            # 最新记录已出勤/已处理时，不能退回到更旧的缺勤活动。
             if len(candidates) > 1:
                 def _created_ts(row):
                     dt = self._parse_end_time(row.get("CreaterDate"))
@@ -1599,7 +1628,20 @@ class DuifenyiApp(ctk.CTk):
                     if self.log_mode == "debug":
                         self.log("debug", f"过期残留静默跳过: ID={sid} CreaterDate={stale.get('CreaterDate')}")
                 candidates = candidates[:1]
-            pending = candidates
+            pending = [r for r in candidates
+                       if str(r.get("StatusID", "")) == "2"
+                       and r.get("ID") not in Course.check_list
+                       and r.get("ID") not in self._expired_signs
+                       and self._extract_remaining_seconds(r) != 0]
+
+        # 排期只能提交本轮仍被选为当前候选的活动，先撤销旧排期再执行。
+        pending_ids = {item.get("ID", "") for item in pending}
+        for hid in list(self._scheduled_signs):
+            if hid not in pending_ids:
+                self._scheduled_signs.pop(hid, None)
+        if self._flush_scheduled_signs() == "ratelimit":
+            self._schedule_next_watch()
+            return
 
         # 记录/清理二维码签到的"首次被检测"时间,供探针侧阈值判断使用
         pending_ids = {item.get("ID", "") for item in pending}
@@ -2113,6 +2155,7 @@ class DuifenyiApp(ctk.CTk):
             return None
 
     def sign(self, sign_code, is_qr=False):
+        sign_code = str(sign_code).strip()  # 原样保留四位签到码中的前导零。
         try:
             with self._session_lock:
                 self.x.get(
@@ -2130,7 +2173,7 @@ class DuifenyiApp(ctk.CTk):
                 if _r.status_code == 200:
                     msg = _r.json().get("msgbox", "")
                     if "签到成功" in msg:
-                        self.log_celebration("签到成功", "签到码模式")
+                        self.log_celebration("签到成功", f"签到码：{sign_code}")
                         return True
                     elif "已结束" in msg or "没有正在进行" in msg or "过期" in msg:
                         return "expired"
@@ -2193,6 +2236,8 @@ class DuifenyiApp(ctk.CTk):
                     return "ratelimit"
                 else:
                     self.log("error", f"❌ 定位签到失败: {msg}")
+            else:
+                self.log("error", f"❌ 定位签到失败: HTTP {_r.status_code}")
         except Exception as e:
             self.log("error", f"❌ 定位签到异常: {e}")
         return False
@@ -2271,6 +2316,7 @@ class DuifenyiApp(ctk.CTk):
         self.refresh_overview()
 
     def get_class_list(self):
+        """返回课程接口是否正常完成；接口报错或网络异常时返回 False。"""
         headers = {"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                    "Referer": f"{self.host}/_UserCenter/PC/CenterStudent.aspx"}
         try:
@@ -2283,7 +2329,9 @@ class DuifenyiApp(ctk.CTk):
                 _json = _r.json()
                 if isinstance(_json, dict) and "msgbox" in _json:
                     self.log("warning", f"⚠️ {_json['msgbox']} 请重新登录。")
-                    self.x.cookies.clear()
+                    with self._session_lock:
+                        self.x.cookies.clear()
+                    return False
                 else:
                     class_name_list = [i["CourseName"] for i in _json]
                     # 控件更新统一走 ui_call，支持从后台登录线程安全调用
@@ -2302,8 +2350,12 @@ class DuifenyiApp(ctk.CTk):
                         Course.class_list = _json
                     self.log("info", f"📚 拉取到 {len(class_name_list)} 门活跃课程")
                     self.ui_call(self.refresh_overview)
+                    return True
+            else:
+                self.log("warning", f"⚠️ 拉取课程列表失败：HTTP {_r.status_code}，请检查网络或重新登录")
         except Exception as e:
             self.log("warning", f"⚠️ 拉取课程列表失败: {type(e).__name__}: {e}（请检查网络或重新登录）")
+        return False
 
     def on_combo_change(self, choice):
         for i in Course.class_list:
