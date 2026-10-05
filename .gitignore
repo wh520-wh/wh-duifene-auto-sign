@@ -88,3 +88,13 @@ qr_test.png
 
 # 本地归档（保留本地，但不入库）
 _archive/
+
+# 临时抓包/定位探针（调研用，含本地路径与测试逻辑，不入库）
+_probe_*.py
+_trilaterate.py
+_readonly_probe.py
+_nocoord_test.py
+_page_dump.html
+_readonly_probe2.py
+_special_probe.py
+_widenet_probe.py

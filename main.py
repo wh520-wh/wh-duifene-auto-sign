@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 对分易自动签到 - 异步高刷性能版
-版本: 6.5.1-dark-ultimate-async
-基于 6.5 原版，修复：密码登录 session 静默过期、空值崩溃、
-布尔配置丢失、线程安全
+版本: 6.7.1
+后台监控、临时失败重试、统一限流调度与二维码响应复用。
 """
 import configparser
 import os
@@ -93,6 +92,9 @@ class DuifenyiApp(ctk.CTk):
         self._ui_queue = queue.Queue()
         self._is_closing = False
         self._watch_task_running = False
+        self._watch_job = None
+        self._watch_retry_at = 0.0
+        self._monitor_generation = 0
         self._manual_schedule_pause = False
         self._saved_course_id = ""
 
@@ -139,10 +141,10 @@ class DuifenyiApp(ctk.CTk):
 
         self.clean_counter = 0
 
-        self.title("对分易自动签到 v6.6")
+        self.title("对分易自动签到 v6.7.1")
         self.set_window_icon()
-        self.geometry("1024x660")
-        self.minsize(840, 560)
+        self.geometry("1120x760")
+        self.minsize(940, 620)
         self.resizable(True, True)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.configure(fg_color="#F7F5EF")
@@ -161,6 +163,8 @@ class DuifenyiApp(ctk.CTk):
         if os.path.exists(icon_path):
             try:
                 self.iconbitmap(icon_path)
+                # CustomTkinter 在 Windows 会延迟设置默认图标；在它之后再应用一次。
+                self.after(350, lambda: self.iconbitmap(icon_path))
             except Exception:
                 pass
 
@@ -207,29 +211,33 @@ class DuifenyiApp(ctk.CTk):
 
     def setup_ui(self):
         # ========== 顶部栏 ==========
-        top_bar = ctk.CTkFrame(self, height=58, fg_color="#1F1D1A", corner_radius=0)
+        top_bar = ctk.CTkFrame(self, height=82, fg_color="#FFFFFF", corner_radius=0)
         top_bar.pack(fill="x")
         top_bar.pack_propagate(False)
 
         title_frame = ctk.CTkFrame(top_bar, fg_color="transparent")
-        title_frame.pack(side="left", padx=24, pady=9)
+        title_frame.pack(side="left", padx=24, pady=12)
         title_row = ctk.CTkFrame(title_frame, fg_color="transparent")
         title_row.pack(anchor="w")
         ctk.CTkLabel(title_row, text="对分易自动签到",
-                     font=ctk.CTkFont(family="Microsoft YaHei UI", size=18, weight="bold"),
-                     text_color="#FFF7ED").pack(side="left", padx=(0, 10))
-        ctk.CTkLabel(title_row, text="v6.6",
+                     font=ctk.CTkFont(family="Microsoft YaHei UI", size=22, weight="bold"),
+                     text_color="#1A1A1A").pack(side="left", padx=(0, 12))
+        ctk.CTkLabel(title_row, text="v6.7.1",
                      font=ctk.CTkFont(family="Consolas", size=11),
-                     text_color="#F59E0B").pack(side="left", pady=(3, 0))
-        status_frame = ctk.CTkFrame(top_bar, fg_color="#292524", corner_radius=18)
-        status_frame.pack(side="right", padx=24, pady=12)
+                     text_color="#B45309", fg_color="#FEF3C7",
+                     corner_radius=4, width=44, height=22).pack(side="left", pady=(3, 0))
+        ctk.CTkLabel(title_frame, text="选择课程，安心监听",
+                     font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
+                     text_color="#6B6560").pack(anchor="w", pady=(2, 0))
+        status_frame = ctk.CTkFrame(top_bar, fg_color="#F5F4F0", corner_radius=8)
+        status_frame.pack(side="right", padx=24, pady=20)
         self.status_frame = status_frame
         self.status_dot = ctk.CTkLabel(status_frame, text="●",
                                        font=ctk.CTkFont(size=14), text_color="#9CA3AF")
         self.status_dot.pack(side="left", padx=(12, 6), pady=4)
         self.status_text = ctk.CTkLabel(status_frame, text="未运行",
                                         font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
-                                        text_color="#FAFAF9")
+                                        text_color="#6B6560")
         self.status_text.pack(side="left", padx=(0, 12), pady=4)
 
         # 顶栏底部分隔线
@@ -237,35 +245,52 @@ class DuifenyiApp(ctk.CTk):
 
         # ========== 主内容区 ==========
         main_container = ctk.CTkFrame(self, fg_color="#F7F5EF")
-        main_container.pack(fill="both", expand=True, padx=12, pady=(10, 8))
+        main_container.pack(fill="both", expand=True, padx=20, pady=(12, 12))
 
-        left_panel = ctk.CTkScrollableFrame(main_container, width=330, fg_color="#EFECE3",
-                                            corner_radius=8,
-                                            scrollbar_button_color="#E8E5E0",
-                                            scrollbar_button_hover_color="#D4D0C8")
-        left_panel.pack(side="left", fill="y", padx=(0, 6))
+        left_panel = ctk.CTkTabview(
+            main_container, width=340, fg_color="#EFECE3", corner_radius=10,
+            segmented_button_fg_color="#E8E5E0",
+            segmented_button_selected_color="#D97706",
+            segmented_button_selected_hover_color="#B45309",
+            segmented_button_unselected_color="#E8E5E0",
+            segmented_button_unselected_hover_color="#D4D0C8", text_color="#1A1A1A")
+        left_panel.pack(side="left", fill="y", padx=(0, 14))
+        panels = {}
+        for name in ("账号", "监听", "定位", "定时"):
+            tab = left_panel.add(name)
+            panel = ctk.CTkScrollableFrame(
+                tab, fg_color="transparent", corner_radius=0,
+                scrollbar_button_color="#D4D0C8",
+                scrollbar_button_hover_color="#B8B1A5")
+            panel.pack(fill="both", expand=True)
+            panels[name] = panel
 
         card_kwargs = {"fg_color": "#FFFFFF", "corner_radius": 8, "border_width": 1, "border_color": "#E7E1D5"}
         label_font = ctk.CTkFont(family="Microsoft YaHei UI", size=13, weight="bold")
 
         # --- 登录模块 ---
-        login_card = ctk.CTkFrame(left_panel, **card_kwargs)
+        login_card = ctk.CTkFrame(panels["账号"], **card_kwargs)
         login_card.pack(fill="x", padx=6, pady=(4, 6))
+        ctk.CTkLabel(login_card, text="01  登录账号", font=label_font,
+                     text_color="#1A1A1A").pack(anchor="w", padx=12, pady=(14, 0))
         self.login_mode = ctk.CTkSegmentedButton(
             login_card, values=["微信登录", "账号登录"], command=self.switch_login_mode,
-            fg_color="#E8E5E0", selected_color="#D97706", unselected_color="#8B7355",
-            selected_hover_color="#B45309", unselected_hover_color="#7A6548",
-            text_color="#FFFFFF")
+            fg_color="#E8E5E0", selected_color="#D97706", unselected_color="#E8E5E0",
+            selected_hover_color="#B45309", unselected_hover_color="#D4D0C8",
+            text_color="#1A1A1A")
         self.login_mode.pack(fill="x", padx=12, pady=12)
         self.login_mode.set("微信登录")
         self.login_frame = ctk.CTkFrame(login_card, fg_color="transparent")
         self.login_frame.pack(fill="x", padx=12, pady=(0, 12))
 
         self.wx_frame = ctk.CTkFrame(self.login_frame, fg_color="transparent")
-        ctk.CTkButton(self.wx_frame, text="⧉ 复制链接", command=self.copy_wx_link,
+        ctk.CTkLabel(self.wx_frame, text="复制引导链接，在微信打开后粘贴返回链接。",
+                     wraplength=265, justify="left", anchor="w",
+                     text_color="#6B6560", font=ctk.CTkFont(size=11)).pack(fill="x", pady=(0, 10))
+        ctk.CTkButton(self.wx_frame, text="复制微信引导链接", command=self.copy_wx_link,
                       height=34, fg_color="#F5F4F0", hover_color="#E8E5E0",
                       text_color="#1A1A1A", corner_radius=8).pack(fill="x", pady=(0, 6))
-        self.link_entry = ctk.CTkEntry(self.wx_frame, placeholder_text="粘贴微信链接...",
+        self.link_entry = ctk.CTkEntry(self.wx_frame, placeholder_text="粘贴微信返回的完整链接",
                                        height=32, fg_color="#FFFFFF",
                                        border_color="#E8E5E0", corner_radius=6,
                                        text_color="#1A1A1A", placeholder_text_color="#9CA3AF")
@@ -293,9 +318,9 @@ class DuifenyiApp(ctk.CTk):
         self.pwd_login_btn.pack(fill="x", pady=(6, 0))
 
         # --- 课程选择 ---
-        course_card = ctk.CTkFrame(left_panel, **card_kwargs)
+        course_card = ctk.CTkFrame(panels["账号"], **card_kwargs)
         course_card.pack(fill="x", padx=6, pady=6)
-        ctk.CTkLabel(course_card, text="课程选择", font=label_font,
+        ctk.CTkLabel(course_card, text="02  选择课程", font=label_font,
                      text_color="#1A1A1A").pack(anchor="w", padx=12, pady=(12, 4))
         self.combo = ctk.CTkComboBox(course_card, values=["请先登录"],
                                      command=self.on_combo_change, height=34,
@@ -303,10 +328,14 @@ class DuifenyiApp(ctk.CTk):
                                      border_color="#E8E5E0", corner_radius=6, state="readonly",
                                      text_color="#1A1A1A", button_hover_color="#D4D0C8")
         self.combo.pack(fill="x", padx=12, pady=(0, 12))
+        self.combo.set("请先登录")
+        ctk.CTkLabel(course_card, text="登录后自动加载课程；监听期间锁定所选课程。",
+                     wraplength=265, justify="left", anchor="w", text_color="#6B6560",
+                     font=ctk.CTkFont(size=11)).pack(fill="x", padx=12, pady=(0, 12))
         # --- 基础设置 ---
-        basic_card = ctk.CTkFrame(left_panel, **card_kwargs)
+        basic_card = ctk.CTkFrame(panels["监听"], **card_kwargs)
         basic_card.pack(fill="x", padx=6, pady=6)
-        ctk.CTkLabel(basic_card, text="基础设置", font=label_font,
+        ctk.CTkLabel(basic_card, text="监听节奏", font=label_font,
                      text_color="#1A1A1A").pack(anchor="w", padx=12, pady=(12, 8))
 
         interval_frame = ctk.CTkFrame(basic_card, fg_color="transparent")
@@ -316,8 +345,8 @@ class DuifenyiApp(ctk.CTk):
         self.interval_preset = ctk.CTkSegmentedButton(
             interval_frame, values=["快速", "标准", "省电"], command=self.set_interval_preset,
             height=26, corner_radius=6, fg_color="#E8E5E0", selected_color="#D97706",
-            unselected_color="#8B7355", selected_hover_color="#B45309",
-            unselected_hover_color="#7A6548", text_color="#FFFFFF",
+            unselected_color="#E8E5E0", selected_hover_color="#B45309",
+            unselected_hover_color="#D4D0C8", text_color="#1A1A1A",
             font=ctk.CTkFont(size=11))
         self.interval_preset.pack(fill="x", expand=True)
         self.interval_preset.set("标准")
@@ -352,12 +381,17 @@ class DuifenyiApp(ctk.CTk):
                                           corner_radius=6, text_color="#1A1A1A",
                                           placeholder_text="0")
         self.trigger_entry.pack(side="left", padx=2)
-        ctk.CTkLabel(trigger_frame, text="秒  检测到后延迟再签,空或0=立即",
+        ctk.CTkLabel(trigger_frame, text="秒",
                      text_color="#9CA3AF",
                      font=ctk.CTkFont(size=10)).pack(side="left", padx=(4, 0))
+        ctk.CTkLabel(basic_card, text="检测到活动后等待指定秒数再签到。\n留空或填 0 表示立即签到。",
+                     justify="left", anchor="w", text_color="#6B6560",
+                     font=ctk.CTkFont(size=11)).pack(fill="x", padx=12, pady=(8, 16))
 
         # 定位签到坐标（支持自定义新增 / 命名 / 改名 / 删除，全部持久化保存）
-        coord_header = ctk.CTkFrame(basic_card, fg_color="transparent")
+        coord_card = ctk.CTkFrame(panels["定位"], **card_kwargs)
+        coord_card.pack(fill="x", padx=6, pady=(4, 6))
+        coord_header = ctk.CTkFrame(coord_card, fg_color="transparent")
         coord_header.pack(fill="x", padx=12, pady=(10, 0))
         ctk.CTkLabel(coord_header, text="定位坐标", text_color="#1A1A1A",
                      anchor="w", font=ctk.CTkFont(family="Microsoft YaHei UI",
@@ -373,26 +407,26 @@ class DuifenyiApp(ctk.CTk):
             {"name": "坐标3", "lon": self.preset_lon_3, "lat": self.preset_lat_3},
         ]
         self.coord_row_widgets = []
-        self.coord_list_frame = ctk.CTkFrame(basic_card, fg_color="transparent")
+        self.coord_list_frame = ctk.CTkFrame(coord_card, fg_color="transparent")
         self.coord_list_frame.pack(fill="x", padx=12, pady=(4, 2))
 
         self.add_coord_btn = ctk.CTkButton(
-            basic_card, text="＋ 新增坐标", command=self.add_coord,
+            coord_card, text="＋ 新增坐标", command=self.add_coord,
             height=28, fg_color="#F5F4F0", hover_color="#E8E5E0",
             text_color="#1A1A1A", corner_radius=6, font=ctk.CTkFont(size=11))
         self.add_coord_btn.pack(fill="x", padx=12, pady=(2, 6))
 
-        jitter_frame = ctk.CTkFrame(basic_card, fg_color="transparent")
+        jitter_frame = ctk.CTkFrame(coord_card, fg_color="transparent")
         jitter_frame.pack(fill="x", padx=12, pady=(2, 12))
         self.coord_jitter_switch = ctk.CTkSwitch(
-            jitter_frame, text="定位坐标随机抖动（≤5米 · 默认关）",
+            jitter_frame, text="坐标随机抖动（≤5米）",
             command=self._snapshot_coords,
             button_color="#D97706", progress_color="#B45309",
             text_color="#6B6560", font=ctk.CTkFont(size=11))
         self.coord_jitter_switch.pack(side="left")
         self.render_coord_list()
 
-        self.advanced_card = ctk.CTkFrame(left_panel, **card_kwargs)
+        self.advanced_card = ctk.CTkFrame(panels["定时"], **card_kwargs)
         self.advanced_card.pack(fill="x", padx=6, pady=6)
 
         advanced_header = ctk.CTkFrame(self.advanced_card, fg_color="transparent")
@@ -475,35 +509,42 @@ class DuifenyiApp(ctk.CTk):
         # === 右侧日志面板 ===
         right_panel = ctk.CTkFrame(main_container, fg_color="#FFFFFF", corner_radius=8,
                                    border_width=1, border_color="#E7E1D5")
-        right_panel.pack(side="right", fill="both", expand=True, padx=(8, 0))
+        right_panel.pack(side="right", fill="both", expand=True)
+        workspace_heading = ctk.CTkFrame(right_panel, fg_color="transparent")
+        workspace_heading.pack(fill="x", padx=18, pady=(12, 4))
+        ctk.CTkLabel(workspace_heading, text="监听工作台", anchor="w",
+                     font=ctk.CTkFont(family="Microsoft YaHei UI", size=18, weight="bold"),
+                     text_color="#1A1A1A").pack(anchor="w")
+        ctk.CTkLabel(workspace_heading, text="课程信息、运行状态与签到结果，一目了然。",
+                     height=18, font=ctk.CTkFont(size=11), text_color="#6B6560").pack(anchor="w")
 
         overview_card = ctk.CTkFrame(right_panel, fg_color="#F5F2EA", corner_radius=8,
                                      border_width=1, border_color="#E7E1D5")
         overview_card.pack(fill="x", padx=12, pady=(10, 6))
 
         overview_head = ctk.CTkFrame(overview_card, fg_color="transparent")
-        overview_head.pack(fill="x", padx=12, pady=(8, 4))
-        ctk.CTkLabel(overview_head, text="当前概览", font=label_font,
+        overview_head.pack(fill="x", padx=12, pady=(4, 2))
+        ctk.CTkLabel(overview_head, text="当前概览", font=label_font, height=22,
                      text_color="#1A1A1A").pack(side="left")
         overview_row_1 = ctk.CTkFrame(overview_card, fg_color="transparent")
         overview_row_1.pack(fill="x", padx=12, pady=(0, 4))
         self.course_value_label = self.create_overview_item(overview_row_1, "当前课程", "#D97706")
-        self.mode_value_label = self.create_overview_item(overview_row_1, "登录方式", "#059669")
+        self.mode_value_label = self.create_overview_item(overview_row_1, "登录方式", "#1A1A1A")
 
         overview_row_2 = ctk.CTkFrame(overview_card, fg_color="transparent")
         overview_row_2.pack(fill="x", padx=12, pady=(4, 0))
-        self.interval_value_label = self.create_overview_item(overview_row_2, "监听区间", "#B45309")
-        self.schedule_value_label = self.create_overview_item(overview_row_2, "定时窗口", "#7C3AED")
+        self.interval_value_label = self.create_overview_item(overview_row_2, "轮询间隔", "#1A1A1A")
+        self.schedule_value_label = self.create_overview_item(overview_row_2, "定时窗口", "#1A1A1A")
 
         self.summary_hint_label = ctk.CTkLabel(
             overview_card, text="", anchor="w", justify="left",
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=11),
-            fg_color="#F3F4F6", corner_radius=6,
+            fg_color="#F5F4F0", corner_radius=6, wraplength=440,
             text_color="#374151")
         self.summary_hint_label.pack(fill="x", padx=12, pady=(8, 8))
 
         log_header = ctk.CTkFrame(right_panel, fg_color="transparent", height=44)
-        log_header.pack(fill="x", padx=12, pady=(2, 2))
+        log_header.pack(fill="x", padx=16, pady=(10, 8))
         header_left = ctk.CTkFrame(log_header, fg_color="transparent")
         header_left.pack(side="left", fill="y")
         ctk.CTkLabel(header_left, text="运行日志", font=label_font,
@@ -511,21 +552,21 @@ class DuifenyiApp(ctk.CTk):
         self.log_mode_btn = ctk.CTkSegmentedButton(
             header_left, values=["精简", "详细", "调试"], command=self.switch_log_mode,
             height=26, corner_radius=6, fg_color="#E8E5E0", selected_color="#D97706",
-            unselected_color="#8B7355", text_color="#FFFFFF",
+            unselected_color="#E8E5E0", text_color="#1A1A1A",
             font=ctk.CTkFont(size=11))
         self.log_mode_btn.pack(side="left")
         self.log_mode_btn.set("精简")
-        ctk.CTkButton(log_header, text="⌦ 清空日志", command=self.clear_log,
+        ctk.CTkButton(log_header, text="清空", command=self.clear_log,
                       width=60, height=26, fg_color="#F5F4F0", hover_color="#E8E5E0",
                       text_color="#1A1A1A", corner_radius=6,
                       font=ctk.CTkFont(size=11)).pack(side="right")
 
         self.text_box = ctk.CTkTextbox(right_panel, fg_color="#FBFAF7", text_color="#1A1A1A",
-                                       font=("Consolas", 12), corner_radius=8,
+                                       font=("Microsoft YaHei UI", 12), corner_radius=8,
                                        border_width=1, border_color="#E7E1D5",
                                        scrollbar_button_color="#E8E5E0",
                                        scrollbar_button_hover_color="#D4D0C8")
-        self.text_box._textbox.configure(undo=False, maxundo=0)
+        self.text_box._textbox.configure(undo=False, maxundo=0, spacing1=3, spacing3=3)
         self.text_box.pack(fill="both", expand=True, padx=12, pady=(0, 10))
 
         self.text_box._textbox.tag_config("success", foreground="#059669",
@@ -534,8 +575,8 @@ class DuifenyiApp(ctk.CTk):
                                           font=("Consolas", 12, "bold"))
         self.text_box._textbox.tag_config("warning", foreground="#D97706",
                                           font=("Consolas", 12, "bold"))
-        self.text_box._textbox.tag_config("info", foreground="#2563EB")
-        self.text_box._textbox.tag_config("schedule", foreground="#7C3AED")
+        self.text_box._textbox.tag_config("info", foreground="#57534E")
+        self.text_box._textbox.tag_config("schedule", foreground="#92400E")
         self.text_box._textbox.tag_config("highlight", foreground="#D97706",
                                           font=("Consolas", 13, "bold"))
         self.text_box._textbox.tag_config("debug", foreground="#9CA3AF",
@@ -543,10 +584,10 @@ class DuifenyiApp(ctk.CTk):
         self.text_box._textbox.tag_config("detail", foreground="#6B6560")
         # 签到成功专属样式：大号粗体 + 醒目的红色 + 居中填充
         self.text_box._textbox.tag_config("celebration",
-                                          foreground="#DC2626",
-                                          font=("Consolas", 15, "bold"))
+                                          foreground="#166534",
+                                          font=("Microsoft YaHei UI", 15, "bold"))
         self.text_box._textbox.tag_config("celebration_bar",
-                                          foreground="#DC2626",
+                                          foreground="#059669",
                                           font=("Consolas", 12, "bold"))
         # 倒计时数字专用：红色加粗
         self.text_box._textbox.tag_config("countdown_num",
@@ -556,25 +597,28 @@ class DuifenyiApp(ctk.CTk):
         self.text_box._textbox.tag_config("ts_sep", foreground="#C4BFB6")
 
         # ========== 底部操作栏 ==========
-        action_bar = ctk.CTkFrame(self, height=70, fg_color="#F7F5EF", corner_radius=0)
-        action_bar.pack(fill="x", side="bottom")
+        action_bar = ctk.CTkFrame(self, height=82, fg_color="#FFFFFF", corner_radius=0)
+        action_bar.pack(fill="x", side="bottom", before=main_container)
         action_bar.pack_propagate(False)
-        self.fab_frame = ctk.CTkFrame(action_bar, fg_color="#FFFFFF", corner_radius=8,
-                                      border_width=1, border_color="#E7E1D5")
-        self.fab_frame.pack(side="right", padx=24, pady=10)
-        self.main_btn = ctk.CTkButton(self.fab_frame, text="▶ 开始监听", command=self.toggle_monitoring,
+        ctk.CTkLabel(action_bar, text="登录账号 → 选择课程 → 开始监听",
+                     font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
+                     text_color="#6B6560").pack(side="left", padx=24)
+        self.fab_frame = ctk.CTkFrame(action_bar, fg_color="transparent")
+        self.fab_frame.pack(side="right", padx=20, pady=12)
+        self.main_btn = ctk.CTkButton(self.fab_frame, text="开始监听", command=self.toggle_monitoring,
                                       width=180, height=46, corner_radius=8,
                                       fg_color="#D97706", hover_color="#B45309",
                                       text_color="#FFFFFF",
                                       font=ctk.CTkFont(family="Microsoft YaHei UI", size=15,
                                                        weight="bold"))
         self.main_btn.pack(side="left", padx=(6, 6), pady=6)
-        self.save_btn = ctk.CTkButton(self.fab_frame, text="💾 保存配置", command=self.save_config,
+        self.save_btn = ctk.CTkButton(self.fab_frame, text="保存配置", command=self.save_config,
                                       width=110, height=46, corner_radius=8,
                                       fg_color="#F5F4F0", hover_color="#E8E5E0",
                                       text_color="#1A1A1A",
                                       font=ctk.CTkFont(family="Microsoft YaHei UI", size=13))
         self.save_btn.pack(side="left", padx=(0, 6), pady=6)
+        self.toggle_advanced()
 
         # 坐标行的 KeyRelease 同步在 render_coord_list() 内逐行绑定
 
@@ -633,9 +677,9 @@ class DuifenyiApp(ctk.CTk):
                             border_width=1, border_color="#EEECE8")
         card.pack(side="left", fill="x", expand=True, padx=(0, 6))
         ctk.CTkLabel(card, text=title, anchor="w", text_color="#6B6560",
-                     font=ctk.CTkFont(size=11)).pack(fill="x", padx=8, pady=(4, 1))
+                     height=18, font=ctk.CTkFont(size=11)).pack(fill="x", padx=8, pady=(4, 1))
         value = ctk.CTkLabel(card, text="--", anchor="w", justify="left",
-                             wraplength=170, text_color=accent_color,
+                              height=22, wraplength=240, text_color=accent_color,
                              font=ctk.CTkFont(family="Microsoft YaHei UI", size=12,
                                               weight="bold"))
         value.pack(fill="x", padx=8, pady=(0, 4))
@@ -730,10 +774,10 @@ class DuifenyiApp(ctk.CTk):
         self.log_mode = mode_map.get(value, "simple")
 
     def update_status(self, status, text=""):
-        colors = {"idle": "#374151", "running": "#14532D", "waiting": "#92400E",
-                  "scheduled": "#1E3A8A", "error": "#7F1D1D"}
-        text_colors = {"idle": "#F9FAFB", "running": "#F0FDF4", "waiting": "#FFFBEB",
-                       "scheduled": "#EFF6FF", "error": "#FEF2F2"}
+        colors = {"idle": "#F5F4F0", "running": "#DCFCE7", "waiting": "#FEF3C7",
+                  "scheduled": "#FEF3C7", "error": "#FEE2E2"}
+        text_colors = {"idle": "#6B6560", "running": "#166534", "waiting": "#92400E",
+                       "scheduled": "#92400E", "error": "#991B1B"}
         if status in colors:
             if hasattr(self, "status_frame"):
                 self.status_frame.configure(fg_color=colors[status])
@@ -742,7 +786,7 @@ class DuifenyiApp(ctk.CTk):
         self.refresh_overview()
 
     def set_main_button_idle(self):
-        self.main_btn.configure(text="▶ 开始监听", state="normal",
+        self.main_btn.configure(text="开始监听", state="normal",
                                 fg_color="#D97706", hover_color="#B45309")
 
     def set_main_button_starting(self):
@@ -750,13 +794,12 @@ class DuifenyiApp(ctk.CTk):
                                 fg_color="#A16207", hover_color="#854D0E")
 
     def set_main_button_running(self):
-        self.main_btn.configure(text="■ 停止监控", state="normal",
+        self.main_btn.configure(text="停止监听", state="normal",
                                 fg_color="#DC2626", hover_color="#B91C1C")
 
     def show_welcome(self):
-        self.log("info", "=" * 48)
-        self.log("highlight", "对分易自动签到 v6.6")
-        self.log("info", "=" * 48)
+        self.log("highlight", "对分易自动签到 v6.7.1")
+        self.log("info", "在左侧登录并选择课程，然后点击「开始监听」。")
 
     def validate_number(self, value):
         return value == "" or value.isdigit()
@@ -1062,6 +1105,9 @@ class DuifenyiApp(ctk.CTk):
     def stop_monitoring(self, manual=False):
         Course.flag = False
         self.is_monitoring = False
+        self._monitor_generation += 1
+        self._cancel_next_watch()
+        self._watch_retry_at = 0.0
         self._scheduled_signs.clear()
         self._countdown_logged.clear()
         self._expired_signs.clear()
@@ -1118,7 +1164,7 @@ class DuifenyiApp(ctk.CTk):
             self.write_config_file()
             self.log("success", "✅ 所有配置参数已全量保存")
             self.save_btn.configure(text="✓ 已保存", fg_color="#059669")
-            self.after(1500, lambda: self.save_btn.configure(text="💾 保存配置", fg_color="#F5F4F0"))
+            self.after(1500, lambda: self.save_btn.configure(text="保存配置", fg_color="#F5F4F0"))
         except Exception as e:
             self.log("error", f"❌ 保存配置失败: {e}")
 
@@ -1322,7 +1368,7 @@ class DuifenyiApp(ctk.CTk):
         """账号密码登录的网络部分，在后台线程执行，避免卡死 UI"""
         headers = {"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                    "Referer": f"{self.host}/AppGate.aspx"}
-        params = f'action=loginmb&loginname={username}&password={password}'
+        params = {'action': 'loginmb', 'loginname': username, 'password': password}
         self.x.cookies.clear()
         try:
             with self._session_lock:
@@ -1380,11 +1426,14 @@ class DuifenyiApp(ctk.CTk):
 
     # ==================== 核心异步化抓包系统 ====================
     def _async_watch_task(self):
+        generation = self._monitor_generation
         try:
             if not Course.flag or not self.is_monitoring:
                 return
 
             login_ok = self.is_login()
+            if generation != self._monitor_generation or not self.is_monitoring:
+                return
             if self.log_mode == "debug":
                 self.log("debug", f"心跳结果: {login_ok}")
             if login_ok is False:
@@ -1404,6 +1453,8 @@ class DuifenyiApp(ctk.CTk):
                         headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
                         timeout=self.req_timeout)
                 if _r.status_code == 200:
+                    if generation != self._monitor_generation or not self.is_monitoring:
+                        return
                     self._process_watch_result(_r.json())
                 else:
                     self._schedule_next_watch()
@@ -1515,7 +1566,9 @@ class DuifenyiApp(ctk.CTk):
             self.log("debug", f"API原始响应: msg={data.get('msg')}({type(data.get('msg')).__name__}), rows数量={len(data.get('rows', []))}")
 
         # 0) 先处理上一轮已排期的签到(到点了就真正发起)
-        self._flush_scheduled_signs()
+        if self._flush_scheduled_signs() == "ratelimit":
+            self._schedule_next_watch()
+            return
 
         rows = data.get("rows", [])
         has_data = str(data.get("msg", "")) == "1" and bool(rows)
@@ -1589,13 +1642,6 @@ class DuifenyiApp(ctk.CTk):
                     self.log("detail", f"⏹️ {sign_type}签到已结束，跳过")
                     continue
 
-                # 二维码预检:发签到请求前先确认 QR 码确实存在(不发签到动作)
-                # 没数据 → 视为已过期,完全静默指纹掉,不打印 📢 / 🔲
-                if HFC_type == '2' and not self._has_active_qr_data():
-                    Course.check_list.append(HFC_ID)
-                    self._expired_signs.add(HFC_ID)
-                    continue
-
                 if threshold > 0:
                     # 阈值语义:检测到签到后延迟 N 秒再签(模拟人工操作延迟)
                     self._schedule_sign_later(HFC_ID, HFC_type, check_code, sign_type, threshold)
@@ -1604,7 +1650,11 @@ class DuifenyiApp(ctk.CTk):
                 # 走到这里 = 真的要签了
                 self._scheduled_signs.pop(HFC_ID, None)
                 self._countdown_logged.clear()
-                self._do_sign_with_log(HFC_ID, HFC_type, check_code, sign_type, pending)
+                result = self._do_sign_with_log(
+                    HFC_ID, HFC_type, check_code, sign_type, pending)
+                if result == "ratelimit":
+                    self._schedule_next_watch()
+                    return
 
         if not has_qr_pending and not self._qr_probe_cooldown():
             threading.Thread(target=self._probe_qr_sign, daemon=True).start()
@@ -1654,6 +1704,9 @@ class DuifenyiApp(ctk.CTk):
                 # 限流:保留原 entry(含原 target_ts)回插排期,延迟倒计时不从头重置,
                 #       下一轮到点继续尝试。其余限流退避流程保持现状。
                 self._scheduled_signs[hid] = entry
+                return "ratelimit"
+            if result == "retry":
+                self._scheduled_signs[hid] = entry
                 continue
             if hid in Course.check_list and hid not in self._expired_signs:
                 # 签到成功,清掉剩余排期与倒计时去重缓存
@@ -1664,8 +1717,8 @@ class DuifenyiApp(ctk.CTk):
 
     def _do_sign_with_log(self, HFC_ID, HFC_type, check_code, sign_type, pending):
         """统一的签到入口,负责日志、成功/失败/限流的分支处理。
-        设计原则:成功才庆祝,失败(过期/无效码)完全静默指纹掉,用户日志里只看到成功。
-        返回 "success"/"ratelimit"/"expired"/"error",供排期路径决定是否回插。"""
+        定位沿用失败一次即停止处理该活动的规则;其他模式保留临时失败重试。
+        返回 "success"/"ratelimit"/"expired"/"retry"。"""
         try:
             status = self._do_sign(HFC_type, check_code, HFC_ID)
             if status == True:
@@ -1679,19 +1732,23 @@ class DuifenyiApp(ctk.CTk):
                 return "success"
             elif status == "ratelimit":
                 self.ui_call(self.update_last_line, "⏳ 频率限制，6秒后重试", "detail")
-                self.ui_after(6000, self.watching_sign)
+                self._watch_retry_at = max(self._watch_retry_at, time.monotonic() + 6)
                 return "ratelimit"
-            else:
-                # False / "expired" / 其它:静默指纹,不打日志,下一轮不再处理
+            elif status == "expired" or str(HFC_type) == '3':
                 Course.check_list.append(HFC_ID)
                 self._expired_signs.add(HFC_ID)
                 return "expired"
+            else:
+                self.log("warning", f"⚠️ {sign_type}签到暂未成功，将在下一轮重试")
+                return "retry"
         except Exception as e:
             if self.log_mode == "debug":
                 self.log("debug", f"⚠️ 签到处理异常: {e}")
-            Course.check_list.append(HFC_ID)
-            self._expired_signs.add(HFC_ID)
-            return "error"
+            if str(HFC_type) == '3':
+                Course.check_list.append(HFC_ID)
+                self._expired_signs.add(HFC_ID)
+                return "expired"
+            return "retry"
 
     def _qr_probe_cooldown(self):
         """每5次轮询探测一次二维码，避免频繁请求"""
@@ -1704,15 +1761,12 @@ class DuifenyiApp(ctk.CTk):
         return True
 
     def _probe_qr_sign(self):
-        """主动探测：先确认有活跃 QR 签到实例，再调 getcodeimage 获取 state"""
+        """复查新出现的二维码条目，沿用主轮询的过滤、延迟与签到入口。"""
         # 停止监控后(手动停止/定时结束)在途探测线程不得再发起签到
         if not (self.is_monitoring and Course.flag):
             return
+        generation = self._monitor_generation
         try:
-            # 第一步：用轮询接口确认当前确实有活跃的 QR 签到（type=2, StatusID=2）
-            # 注:此 gate 要求 rows 里能看到 QR 条目;而能进入探测分支的前提恰是主轮询 rows 中
-            #     没有 QR,故该 gate 会让"纯靠图片接口兜底"的场景几乎失效。在缺乏 2026 机制的
-            #     真实抓包验证前保守保留现状(改动会触及签到探测的请求行为)。
             with self._session_lock:
                 _r = self.x.post(
                     url=f"{self.host}/_CheckIn/MBCount.ashx",
@@ -1722,62 +1776,26 @@ class DuifenyiApp(ctk.CTk):
             if _r.status_code != 200:
                 self._schedule_next_watch()
                 return
-            rows = _r.json().get("rows", [])
+            if generation != self._monitor_generation or not self.is_monitoring:
+                return
+            data = _r.json()
+            rows = data.get("rows", [])
             has_active_qr = any(
                 str(r.get("StatusID", "")) == "2"
                 and str(r.get("CheckInType", "")) == "2"
                 and r.get("ID") not in Course.check_list
+                and r.get("ID") not in self._expired_signs
                 for r in rows
             )
             if not has_active_qr:
                 self._schedule_next_watch()
                 return
 
-            # 第二步：确认有活跃 QR 后，再调 getcodeimage 获取 state
-            with self._session_lock:
-                _r = self.x.post(
-                    url=f"{self.host}/_CheckIn/CheckIn.ashx",
-                    data=f"action=getcodeimage&cid={Course.id}",
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                        "Referer": f"{self.host}/_CheckIn/MB/TeachCheckIn.aspx",
-                        "X-Requested-With": "XMLHttpRequest",
-                    },
-                    timeout=self.req_timeout)
-            if _r.status_code == 200:
-                data = _r.json()
-                if str(data.get("msg")) == "1" and data.get("data"):
-                    self._handle_qr_probe_hit()
-                    return
+            self._process_watch_result(data)
+            return
         except Exception as e:
             if self.log_mode == "debug":
                 self.log("debug", f"QR探测异常: {e}")
-        self._schedule_next_watch()
-
-    def _handle_qr_probe_hit(self):
-        """getcodeimage 探测到活跃二维码签到"""
-        # 停止监控后不得补发签到
-        if not (self.is_monitoring and Course.flag):
-            return
-        # 阈值判断:首次见到二维码签到条目后,未到阈值则推迟本次签到
-        threshold = getattr(self, '_active_trigger_seconds', 0)
-        if threshold > 0 and self._qr_first_seen:
-            earliest_ts = min(self._qr_first_seen.values())
-            elapsed = datetime.now().timestamp() - earliest_ts
-            if elapsed < threshold:
-                wait_left = int(threshold - elapsed)
-                self.log("detail", f"🕒 二维码签到延迟中,还需 {wait_left} 秒")
-                self._schedule_next_watch()
-                return
-        self.log("info", "📢 探测到二维码签到（通过QR图片接口），执行签到")
-        try:
-            status = self._do_qr_sign("")
-            if status == "ratelimit":
-                self.ui_call(self.update_last_line, "⏳ 频率限制，6秒后重试", "detail")
-                self.ui_after(6000, self.watching_sign)
-                return
-        except Exception as e:
-            self.log("warning", f"⚠️ QR探测签到异常: {e}")
         self._schedule_next_watch()
 
     def _do_sign(self, check_type, check_code, check_id):
@@ -1792,28 +1810,44 @@ class DuifenyiApp(ctk.CTk):
         return False
 
     def _do_qr_sign(self, check_id):
-        """二维码签到：通过 getcodeimage 获取 QR 图片，解码提取 state。
-        设计原则:不打印「🔲 尝试获取」这种事前预告,只在拿到 state 或
-        确认无数据后再说话,过期/无效场景下完全静默。"""
-        state = self._get_qr_state()
+        """先按实测记录用活跃条目 ID 直签，被拒后才解码图片兜底。
+        超时/限流直接重试原路径，不触发额外图片请求。"""
+        if not hasattr(self, '_signed_states'):
+            self._signed_states = set()
+        direct_state = str(check_id or "")
+        if direct_state:
+            if direct_state in self._signed_states:
+                return True
+            result = self.sign(direct_state, is_qr=True)
+            if result == True:
+                self._signed_states.add(direct_state)
+                return True
+            if result in ("retry", "ratelimit", "expired"):
+                return result
+            self.log("detail", "签到 ID 提交未通过，尝试二维码解码备用路径")
+        qr_data = self._fetch_qr_data()
+        if qr_data is None:
+            return "retry"
+        if not qr_data:
+            return "expired"
+        state = self._get_qr_state(qr_data)
         if state:
             # state 级去重：同一个 state 不重复签到
-            if not hasattr(self, '_signed_states'):
-                self._signed_states = set()
             if state in self._signed_states:
                 self.log("detail", f"⏭️ state={state} 已签过，跳过")
                 return True
-            self.log("info", f"🔑 获取到 state={state}，执行签到...")
+            if state == direct_state:
+                return "retry"  # 同一个 state 刚被拒绝，避免本轮重复提交。
+            self.log("detail", "二维码解码成功，使用备用入口提交")
             result = self.sign(state, is_qr=True)
             if result == True:
                 self._signed_states.add(state)
             return result
-        # 没有 QR 数据 → 视为已过期/签到已结束,让上层把 ID 指纹掉
-        return "expired"
+        # 解码失败或依赖缺失不代表签到已过期。
+        return "retry"
 
-    def _has_active_qr_data(self):
-        """轻量级预检:只问 getcodeimage 当前有没有可签的二维码数据,不解码不发签到请求。
-        True=有可签 QR,False=已过期/未发布/接口异常。"""
+    def _fetch_qr_data(self):
+        """返回本轮二维码图片;空串=服务端明确无数据,None=暂时无法判断。"""
         try:
             with self._session_lock:
                 _r = self.x.post(
@@ -1826,14 +1860,17 @@ class DuifenyiApp(ctk.CTk):
                     },
                     timeout=self.req_timeout)
             if _r.status_code != 200:
-                return False
+                return None
             data = _r.json()
-            return str(data.get("msg")) == "1" and bool(data.get("data"))
+            if str(data.get("msg")) == "1":
+                return data.get("data") or ""
+            # 非成功响应可能是会话/接口错误，不足以确认活动结束。
+            return None
         except Exception:
-            return False
+            return None
 
-    def _get_qr_state(self):
-        """通过 getcodeimage 获取 QR 图片并解码出 state"""
+    def _get_qr_state(self, qr_data):
+        """解码本轮已获取的二维码图片，不重复请求 getcodeimage。"""
         # 依赖自检:Pillow/pyzbar(及其 libzbar DLL)缺失时显式告警(仅一次),
         #          不再把 ImportError 静默当作"已过期"指纹掉,导致二维码签到无声失效。
         try:
@@ -1847,22 +1884,7 @@ class DuifenyiApp(ctk.CTk):
                                   f"请安装 Pillow / pyzbar 后重启程序")
             return None
         try:
-            with self._session_lock:
-                _r = self.x.post(
-                    url=f"{self.host}/_CheckIn/CheckIn.ashx",
-                    data=f"action=getcodeimage&cid={Course.id}",
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                        "Referer": f"{self.host}/_CheckIn/MB/TeachCheckIn.aspx",
-                        "X-Requested-With": "XMLHttpRequest",
-                    },
-                    timeout=self.req_timeout)
-            if _r.status_code != 200:
-                return None
-            data = _r.json()
-            if str(data.get("msg")) != "1" or not data.get("data"):
-                return None
-            qr_bytes = base64.b64decode(data["data"])
+            qr_bytes = base64.b64decode(qr_data)
             img = Image.open(io.BytesIO(qr_bytes))
             results = qr_decode(img)
             for result in results:
@@ -1919,13 +1941,13 @@ class DuifenyiApp(ctk.CTk):
             bottom.pack(fill="x", padx=6, pady=(0, 5))
             ctk.CTkLabel(bottom, text="经度", text_color="#9CA3AF",
                          font=ctk.CTkFont(size=10), width=28, anchor="w").pack(side="left")
-            lon_entry = ctk.CTkEntry(bottom, width=92, placeholder_text="经度", **entry_kw)
+            lon_entry = ctk.CTkEntry(bottom, width=82, placeholder_text="经度", **entry_kw)
             lon_entry.pack(side="left", padx=(2, 8))
             lon_entry.insert(0, c.get("lon", ""))
             lon_entry.bind("<KeyRelease>", self._snapshot_coords)
             ctk.CTkLabel(bottom, text="纬度", text_color="#9CA3AF",
                          font=ctk.CTkFont(size=10), width=28, anchor="w").pack(side="left")
-            lat_entry = ctk.CTkEntry(bottom, width=92, placeholder_text="纬度", **entry_kw)
+            lat_entry = ctk.CTkEntry(bottom, width=82, placeholder_text="纬度", **entry_kw)
             lat_entry.pack(side="left", padx=(2, 0))
             lat_entry.insert(0, c.get("lat", ""))
             lat_entry.bind("<KeyRelease>", self._snapshot_coords)
@@ -2047,7 +2069,23 @@ class DuifenyiApp(ctk.CTk):
         if Course.flag and self.is_monitoring:
             delay_ms = int(random.uniform(self.check_interval_min,
                                           self.check_interval_max) * 1000)
-            self.ui_after(delay_ms, self.watching_sign)
+            backoff_ms = math.ceil(max(0, self._watch_retry_at - time.monotonic()) * 1000)
+            self.ui_call(self._queue_next_watch, max(delay_ms, backoff_ms), self._monitor_generation)
+
+    def _cancel_next_watch(self):
+        if self._watch_job is not None:
+            self.after_cancel(self._watch_job)
+            self._watch_job = None
+
+    def _queue_next_watch(self, delay_ms, generation):
+        if generation != self._monitor_generation or not (Course.flag and self.is_monitoring):
+            return
+        self._cancel_next_watch()
+        self._watch_job = self.after(delay_ms, self._run_next_watch)
+
+    def _run_next_watch(self):
+        self._watch_job = None
+        self.watching_sign()
 
     def watching_sign(self):
         if not Course.flag:
@@ -2056,6 +2094,7 @@ class DuifenyiApp(ctk.CTk):
             self.stop_monitoring()
             return
         if self._watch_task_running:
+            self._schedule_next_watch()
             return
         self._watch_task_running = True
         threading.Thread(target=self._async_watch_task, daemon=True).start()
@@ -2114,12 +2153,17 @@ class DuifenyiApp(ctk.CTk):
                         self.log_celebration("二维码签到成功", "扫码模式")
                         return True
                     else:
+                        if "频繁" in _r.text or "等待" in _r.text:
+                            return "ratelimit"
+                        if "已结束" in _r.text or "没有正在进行" in _r.text or "过期" in _r.text:
+                            return "expired"
                         if self.log_mode == "debug":
                             self.log("debug", "二维码签到被拒：未找到成功标记")
                     return False
         except Exception as e:
             self.log("error", f"❌ 签到异常: {e}")
-        return False
+            return "retry"
+        return "retry"
 
     def sign_location(self, longitude, latitude):
         lon = str(longitude)
@@ -2190,6 +2234,9 @@ class DuifenyiApp(ctk.CTk):
         self.log("success", f"🎯 进程锁已绑定：【{course_name}】")
         Course.flag = True
         self.is_monitoring = True
+        self._monitor_generation += 1
+        self._watch_retry_at = 0.0
+        self._cancel_next_watch()
         self.waiting_for_schedule = False
         self._manual_schedule_pause = False
         self.stop_schedule_countdown()
@@ -2283,8 +2330,8 @@ class DuifenyiApp(ctk.CTk):
         except Exception:
             missing.append("lxml")
         if missing:
-            self.log("error", f"⚠️ 缺少依赖 {', '.join(missing)}：二维码签到可能无法使用，"
-                              f"请执行 pip install {' '.join(missing)} 后重启程序")
+            self.log("warning", f"⚠️ 缺少依赖 {', '.join(missing)}：部分解析功能不可用。"
+                                "二维码图片解码仅作为备用路径，ID 直接提交不依赖 Pillow / pyzbar。")
 
     def init(self):
         # 本地部分（建文件/读 cookie）在主线程快速完成，网络部分丢到后台线程，避免开机卡死窗口
@@ -2325,11 +2372,21 @@ class DuifenyiApp(ctk.CTk):
 
 
 if __name__ == '__main__':
-    if not check_single_instance():
+    if sys.platform == 'win32':
+        # 使用稳定的应用标识，让任务栏按 EXE 身份显示和分组。
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Duifenyi.AutoSign.Desktop')
+    # 打包后的离线启动自检：不加载账号配置、不建立网络会话，窗口自动退出。
+    smoke_test = '--smoke-test' in sys.argv
+    if not smoke_test and not check_single_instance():
         if sys.platform == "win32":
             ctypes.windll.user32.MessageBoxW(
                 0, "检测到后台已存在运行的对分易签到实例！\n为了防止接口互抢和封号，请勿多开。",
                 "运行限制", 0x30)
         sys.exit(0)
+    if smoke_test:
+        DuifenyiApp.load_config = lambda self: None
+        DuifenyiApp.init = lambda self: None
     app = DuifenyiApp()
+    if smoke_test:
+        app.after(1500, app.destroy)
     app.mainloop()
